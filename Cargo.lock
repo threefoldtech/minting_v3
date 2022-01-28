@@ -4454,6 +4454,7 @@ dependencies = [
 [[package]]
 name = "tfchain_client"
 version = "0.1.0"
+source = "git+https://github.com/threefoldtech/tfchain_client?branch=main#2ca301fb6f0973737d57c7977eb8e0fe8a3fa2f7"
 dependencies = [
  "chrono",
  "clap",
