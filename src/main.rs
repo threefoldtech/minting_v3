@@ -1,5 +1,5 @@
 use chrono::prelude::*;
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::mpsc;
 use tfchain_client::{
     client::{Client, MultiSignature, Pair, SharedClient},
@@ -36,6 +36,10 @@ fn main() {
 
     println!("Block import pipeline finished");
     let bar = ProgressBar::new(blocks as u64);
+    bar.set_style(
+        ProgressStyle::default_bar()
+            .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
+    );
     let mut last_height = start_block - 1;
     for block in block_import {
         assert_eq!(block.height, last_height + 1);
@@ -43,6 +47,7 @@ fn main() {
         // update last height for sanity check
         last_height = block.height;
         // finally update progress bar
+        bar.set_message(block.timestamp.to_rfc2822());
         bar.inc(1);
     }
 
