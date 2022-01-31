@@ -4062,7 +4062,7 @@ checksum = "35391ea974fa5ee869cb094d5b437688fbf3d8127d64d1b9fed5822a1ed39b12"
 [[package]]
 name = "sp-std"
 version = "4.0.0"
-source = "git+https://github.com/paritytech/substrate#da534d7f945c72b373f157826a95786543a6ec9c"
+source = "git+https://github.com/paritytech/substrate#4b48e8ec7dffcb599248040f4da5be3de3c09318"
 
 [[package]]
 name = "sp-storage"
@@ -4454,7 +4454,7 @@ dependencies = [
 [[package]]
 name = "tfchain_client"
 version = "0.1.0"
-source = "git+https://github.com/threefoldtech/tfchain_client?branch=main#2ca301fb6f0973737d57c7977eb8e0fe8a3fa2f7"
+source = "git+https://github.com/threefoldtech/tfchain_client?branch=main#1eab4958754a9b31aaf5fd2fb30b7006f097307f"
 dependencies = [
  "chrono",
  "clap",

@@ -3,14 +3,45 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::{collections::BTreeMap, sync::mpsc};
 use tfchain_client::{
     client::{Client, MultiSignature, Pair, SharedClient},
-    events::{TFGridEvent, TfchainEvent},
-    types::{BlockNumber, CertificationType, Location, Node, Resources},
+    events::{SmartContractEvent, TFGridEvent, TfchainEvent},
+    types::{BlockNumber, CertificationType, ContractData, Location, Resources},
     window::Window,
 };
 
 const RPC_THREADS: usize = 100;
 const PRE_FETCH: usize = 5;
 const UPTIME_GRACE_PERIOD_SECONDS: i64 = 60;
+const GIB: u128 = 1024 * 1024 * 1024;
+const ONE_MILL: u128 = 1_000_000;
+/// Reward for 1 CU per period in mUSD.
+/// Value taken from [the
+/// wiki](https://library.threefold.me/info/threefold#/tfgrid/farming/threefold__farming_reward?id=farming-reward-calculation)
+/// on 31-01-2022.
+const CU_REWARD_MUSD: u64 = 2400;
+/// Reward for 1 SU per period in mUSD.
+/// Value taken from [the
+/// wiki](https://library.threefold.me/info/threefold#/tfgrid/farming/threefold__farming_reward?id=farming-reward-calculation)
+/// on 31-01-2022.
+const SU_REWARD_MUSD: u64 = 1000;
+/// Reward for 1 NU per period in mUSD.
+/// Value taken from [the
+/// wiki](https://library.threefold.me/info/threefold#/tfgrid/farming/threefold__farming_reward?id=farming-reward-calculation)
+/// on 31-01-2022.
+const NU_REWARD_MUSD: u64 = 30;
+/// Reward for 1 IP reserved for 1 hour in mUSD.
+/// Value taken from [the
+/// wiki](https://library.threefold.me/info/threefold#/tfgrid/farming/threefold__farming_reward?id=farming-reward-calculation)
+/// on 31-01-2022.
+const IP_REWARD_MUSD: u64 = 5;
+/// Price of TFT in mUSD.
+/// Value taken from [the
+/// wiki](https://library.threefold.me/info/threefold#/tfgrid/farming/threefold__farming_reward?id=farming-reward-calculation)
+/// on 31-01-2022.
+const DAO_CONNECTION_PRICE_MUSD: u64 = 80; // 0.08USD
+/// The amount of "units" that make 1 TFT.
+const UNITS_PER_TFT: u64 = 10_000_000;
+/// The amount of blocks expected in an hour.
+const BLOCKS_IN_HOUR: u32 = 10 * 60; // 10 blocks per minute
 
 fn main() {
     let mut args = std::env::args();
@@ -28,10 +59,12 @@ fn main() {
     println!("Finding end block");
     let end_block = client.height_at_timestamp(end_ts).unwrap();
 
+    let start_window = Window::at_height(client.clone(), start_block)
+        .unwrap()
+        .unwrap();
+
     // Grab existing nodes
-    let mut nodes: BTreeMap<_, _> = Window::at_height(client.clone(), start_block)
-        .unwrap()
-        .unwrap()
+    let mut nodes: BTreeMap<_, _> = start_window
         .nodes()
         .unwrap()
         .into_iter()
@@ -52,18 +85,99 @@ fn main() {
                     uptime_info: None,
                     first_uptime_violation: None,
                     connected: NodeConnected::Old,
+                    connection_price: DAO_CONNECTION_PRICE_MUSD,
+                    capacity_consumption: TotalConsumption::default(),
                 },
             )
         })
         .collect();
     println!("Found {} existing nodes", nodes.len());
+
     // Grab existing contracts
+    let mut contracts: BTreeMap<_, _> = start_window
+        .contracts(true)
+        .unwrap()
+        .into_iter()
+        .filter_map(|contract| {
+            let contract = contract.unwrap();
+            // Namecontract is actually billed once deployed through a node contract.
+            if let ContractData::NodeContract(nc) = contract.contract_type {
+                Some((
+                    contract.contract_id,
+                    Contract {
+                        contract_id: contract.contract_id,
+                        node_id: nc.node_id,
+                        // a report should pop up for this
+                        last_report_ts: start_window.date().unwrap().timestamp(),
+                        last_reported_nru: 0,
+                        ips: nc.public_ips,
+                    },
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    println!("Found {} existing contracts", contracts.len());
+
+    // Fetch the last known consumption reports for the active contracts so we have a baseline to
+    // work from. It is possible that a bit of the network was consumed in the previous period.
+    // This will be corrected by not gathering consumption reports after the period ends. So
+    // essentially this small time window (max 1 hour) is covered in the next payout.
+    println!("Extract consumption reports for existing contracts");
+    let consumption_blocks = block_import(
+        client.clone(),
+        start_block - BLOCKS_IN_HOUR - 1,
+        start_block - 1,
+    );
+
+    let bar = ProgressBar::new(BLOCKS_IN_HOUR as u64);
+    bar.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {wide_bar} {pos:>3}/{len:>3} (ETA: {eta_precise})"),
+    );
+    for block in consumption_blocks {
+        for event in block.events {
+            if let TfchainEvent::SmartContract(contract_event) = event {
+                match contract_event {
+                    SmartContractEvent::ConsumptionReportReceived(report) => {
+                        let contract = match contracts.get_mut(&report.contract_id) {
+                            Some(contract) => contract,
+                            None => panic!(
+                                "can't report consumption for unknown contract {} in block {}",
+                                report.contract_id, block.height
+                            ),
+                        };
+                        contract.last_report_ts = report.timestamp as i64;
+                        contract.last_reported_nru = report.nru;
+                    }
+                    SmartContractEvent::ContractCreated(contract) => {
+                        // we only care about node contracts
+                        if let ContractData::NodeContract(nc) = contract.contract_type {
+                            contracts.insert(
+                                contract.contract_id,
+                                Contract {
+                                    contract_id: contract.contract_id,
+                                    node_id: nc.node_id,
+                                    last_report_ts: block.timestamp.timestamp(),
+                                    last_reported_nru: 0,
+                                    ips: nc.public_ips,
+                                },
+                            );
+                        };
+                    }
+                    _ => {}
+                };
+            };
+        }
+        bar.inc(1);
+    }
+    bar.finish_and_clear();
 
     println!("Setup block import pipeline");
     let blocks = end_block - start_block + 1;
     let block_import = block_import(client, start_block, end_block);
 
-    println!("Block import pipeline finished");
     let bar = ProgressBar::new(blocks as u64);
     bar.set_style(
         ProgressStyle::default_bar()
@@ -92,6 +206,8 @@ fn main() {
                                 uptime_info: None,
                                 first_uptime_violation: None,
                                 connected: NodeConnected::Current(block.timestamp.timestamp()),
+                                connection_price: DAO_CONNECTION_PRICE_MUSD,
+                                capacity_consumption: TotalConsumption::default(),
                             },
                         );
                     }
@@ -144,8 +260,8 @@ fn main() {
                             let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
                             // There are quite some situations here. Notice that due to the
                             // blockchain only producing blocks every 6 seconds, and network delay
-                            // + a host of ther issues, we will allow a node to report uptime with
-                            // "grace peirod" of a minute or so in either direction.
+                            // + a host of other issues, we will allow a node to report uptime with
+                            // "grace period" of a minute or so in either direction.
                             //
                             // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
                             //    rubish.
@@ -162,8 +278,8 @@ fn main() {
                                 && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
                             {
                                 // It is technically possible for the delta to be less than 0 and
-                                // within the expected timeframe. If nodes boot, send uptime, then
-                                // immediatly reboot that is possible. In those cases, handle that
+                                // within the expected time frame. If nodes boot, send uptime, then
+                                // immediately reboot that is possible. In those cases, handle that
                                 // below, as that is the reboot detection.
                                 if uptime_delta > 0 {
                                     // Simply add the uptime delta. If this is too large or low by a
@@ -192,19 +308,80 @@ fn main() {
                                 continue;
                             }
 
-                            // We should hae handled all cases. Make this explicit here.
+                            // We should have handled all cases. Make this explicit here.
                             unreachable!();
                         } else {
                             let period_duration = current_time as i64 - start_ts;
                             // Make sure we don't give more credit than the current length of the
                             // period.
-                            // TODO: make sure this stil works if we prefetch blocks for contracts
+                            // TODO: make sure this still works if we prefetch blocks for contracts
                             let up_in_period =
                                 std::cmp::min(period_duration as u64, reported_uptime);
                             // Save uptime info
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, up_in_period));
                         }
+                    }
+                    _ => {}
+                },
+                TfchainEvent::SmartContract(contract_event) => match contract_event {
+                    SmartContractEvent::ConsumptionReportReceived(report) => {
+                        let contract = match contracts.get_mut(&report.contract_id) {
+                            Some(contract) => contract,
+                            None => panic!(
+                                "can't report consumption for unknown contract {} in block {}",
+                                report.contract_id, block.height
+                            ),
+                        };
+                        let node = match nodes.get_mut(&contract.node_id) {
+                            Some(node) => node,
+                            None => {
+                                panic!(
+                                    "can't process consumption for unknown node {} in block {}",
+                                    contract.node_id, block.height
+                                )
+                            }
+                        };
+                        // Just to make sure
+                        assert!(report.timestamp as i64 > contract.last_report_ts);
+
+                        let time_elapsed = report.timestamp - contract.last_report_ts as u64;
+                        node.capacity_consumption.cru += (report.cru * time_elapsed) as u128;
+                        node.capacity_consumption.mru += (report.mru * time_elapsed) as u128;
+                        node.capacity_consumption.hru += (report.hru * time_elapsed) as u128;
+                        node.capacity_consumption.sru += (report.sru * time_elapsed) as u128;
+                        node.capacity_consumption.ips += contract.ips as u64 * time_elapsed;
+                        // Need to detect if the counter for nru was reset
+                        let nru_used = if contract.last_reported_nru > report.nru {
+                            // Counter reset
+                            report.nru
+                        } else {
+                            report.nru - contract.last_reported_nru
+                        };
+                        node.capacity_consumption.nru += nru_used;
+
+                        contract.last_reported_nru = report.nru;
+                        contract.last_report_ts = report.timestamp as i64;
+                    }
+                    SmartContractEvent::ContractCreated(contract) => {
+                        // we only care about node contracts
+                        if let ContractData::NodeContract(nc) = contract.contract_type {
+                            contracts.insert(
+                                contract.contract_id,
+                                Contract {
+                                    contract_id: contract.contract_id,
+                                    node_id: nc.node_id,
+                                    last_report_ts: block.timestamp.timestamp(),
+                                    last_reported_nru: 0,
+                                    ips: nc.public_ips,
+                                },
+                            );
+                        };
+                    }
+                    SmartContractEvent::NodeContractCanceled(contract_id, _, _) => {
+                        let contract = contracts.remove(&contract_id);
+                        // This should be a known contract
+                        assert!(contract.is_some());
                     }
                     _ => {}
                 },
@@ -221,10 +398,14 @@ fn main() {
 
     bar.finish();
 
-    println!("node_id,twin_id,farm_id,measured_uptime,cru,mru,hru,sru,violation");
+    // TODO: add consumption stats
+    println!("node_id,twin_id,farm_id,measured_uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,cru,mru,hru,sru,DIY state,violation");
     for (_, node) in nodes {
+        let (cu, su, nu) = node.cloud_units_permill();
+        let musd = node.node_payout_musd();
+        let tft = node.node_payout_tft_units();
         println!(
-            "{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             node.id,
             node.twin_id,
             node.farm_id,
@@ -233,10 +414,25 @@ fn main() {
             } else {
                 0
             },
+            format_args!("{}.{:06}", cu / ONE_MILL as u64, cu % ONE_MILL as u64),
+            format_args!("{}.{:06}", su / ONE_MILL as u64, su % ONE_MILL as u64),
+            format_args!("{}.{:06}", nu / ONE_MILL as u64, nu % ONE_MILL as u64),
+            format_args!("{}.{:03}", musd / 1_000, musd % 1_000),
+            format_args!("{}.{:07}", tft / UNITS_PER_TFT, tft % UNITS_PER_TFT),
+            format_args!(
+                "{}.{:03}",
+                node.connection_price / 1_000,
+                node.connection_price % 1_000
+            ),
             node.resources.cru,
             node.resources.mru,
             node.resources.hru,
             node.resources.sru,
+            if let CertificationType::Certified = node.certification_type {
+                "CERTIFIED"
+            } else {
+                "DIY"
+            },
             if let Some(violation) = node.first_uptime_violation {
                 violation
             } else {
@@ -327,7 +523,101 @@ struct MintingNode {
     certification_type: CertificationType,
     // (last ping, last reported uptime, total uptime).
     uptime_info: Option<(i64, u64, u64)>,
-    // Block where the first uptime reprot violation was detected, if any.
+    // Block where the first uptime report violation was detected, if any.
     first_uptime_violation: Option<u32>,
     connected: NodeConnected,
+    // TFT price expressed in USD at time of connection. Price is expressed in mUSD (3 digits
+    // precision). I.e. 1 USD => 1000.
+    connection_price: u64,
+    // capacity consumed by workloads over a period.
+    capacity_consumption: TotalConsumption,
+}
+
+impl MintingNode {
+    /// Compute the CU, SU and NU for the node. The result is expressed in a "permill" way. So the
+    /// actual CU, SU and NU are obtained by dividing the results by 1_000_000.
+    ///
+    /// In order for this to be accurate, the data about network and IP usage needs to already have
+    /// been aggregated on the node object.
+    ///
+    /// Calculation taken from [the
+    /// wiki](https://library.threefold.me/info/threefold#/tfgrid/farming/threefold__resource_units_calc_cloudunits)
+    /// on 31-01-2022 as follows:
+    ///   CU: MIN(cru * 4 / 2, (mru - 1) / 4, sru / 50)
+    ///   SU: hru / 1200 + sru * 0.8 / 200
+    ///   NU: gigabytes of public traffic reported
+    fn cloud_units_permill(&self) -> (u64, u64, u64) {
+        // Calculate CU first. Mru and sru are in bytes, but are expressed in GB in the formula.
+        // Rather than dividing first, we multiply cru first, then take the MIN, and finally
+        // divide. This eliminates the issue of rounding errors _BEFORE_ the MIN. Also multiply by
+        // 1000000 so we have precision without working with floats.
+        //
+        // MIN is associative.
+        let cu_intermediate = std::cmp::min(
+            self.resources.cru as u128 * GIB * ONE_MILL,
+            (self.resources.mru as u128 - 1 * GIB) * ONE_MILL / 4,
+        );
+        let cu = std::cmp::min(cu_intermediate, self.resources.sru as u128 * ONE_MILL / 50);
+        let su = self.resources.hru as u128 * ONE_MILL / 1200
+            + self.resources.sru as u128 * ONE_MILL / 250;
+        let nu = self.capacity_consumption.nru as u128 * ONE_MILL;
+        ((cu / GIB) as u64, (su / GIB) as u64, (nu / GIB) as u64)
+    }
+
+    /// Calculate the USD payout of the node in a minting period based on its cloud units. The
+    /// payout is expressed in mUSD, i.e. 1 USD == 1000.
+    ///
+    /// In order for this to be accurate, the data about network and IP usage needs to already have
+    /// been aggregated on the node object.
+    ///
+    /// Payout =
+    ///     CU * CU_REWARD
+    ///     + SU * SU_REWARD
+    ///     + NU used * NU REWARD
+    ///     + IP used * IP REWARD
+    ///
+    /// Additionally, "certified" nodes get 25% extra.
+    fn node_payout_musd(&self) -> u64 {
+        let (cu, su, nu) = self.cloud_units_permill();
+        let cu_reward = cu * CU_REWARD_MUSD;
+        let su_reward = su * SU_REWARD_MUSD;
+        let nu_reward = nu * NU_REWARD_MUSD;
+        // Recall that IP usage is actually in seconds. Multiply the seconds of IP usage with the
+        // hourly reward, then divide by 3600 seconds/hour. This prevents issues with low usage.
+        let ip_reward = self.capacity_consumption.ips * IP_REWARD_MUSD / 3600;
+        let base_payout = (cu_reward + su_reward + nu_reward) / ONE_MILL as u64 + ip_reward;
+        if matches!(self.certification_type, CertificationType::Certified) {
+            base_payout * 5 / 4
+        } else {
+            base_payout
+        }
+    }
+
+    /// Calculate the TFT payout of the node in the minting period based on its cloud units and
+    /// connection price. The payout is expressed in "units", where 1 TFT == 10_000_000 units.
+    /// This also acconts for measured NU and Ip usage.
+    fn node_payout_tft_units(&self) -> u64 {
+        // connection price is in mUSD.
+        self.node_payout_musd() * UNITS_PER_TFT / self.connection_price
+    }
+}
+
+struct Contract {
+    contract_id: u64,
+    node_id: u32,
+    // timestamp of last report. If not set, time when the contract was created.
+    last_report_ts: i64,
+    last_reported_nru: u64,
+    ips: u32,
+}
+
+#[derive(Default)]
+struct TotalConsumption {
+    // cru mru hru sru and ips is value * time
+    cru: u128,
+    sru: u128,
+    hru: u128,
+    mru: u128,
+    ips: u64,
+    nru: u64,
 }
