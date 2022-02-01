@@ -144,7 +144,7 @@ fn main() {
     let consumption_blocks =
         block_import(client.clone(), contract_search_start_block, start_block - 1);
 
-    let bar = ProgressBar::new((start_block - contract_search_start_block) as u64 + 1);
+    let bar = ProgressBar::new((start_block - contract_search_start_block) as u64 - 1);
     bar.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] {wide_bar} {pos:>3}/{len:>3} (ETA: {eta_precise})"),
