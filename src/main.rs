@@ -59,12 +59,10 @@ fn main() {
     println!("Finding end block");
     let end_block = client.height_at_timestamp(end_ts).unwrap();
 
-    let start_window = Window::at_height(client.clone(), start_block)
-        .unwrap()
-        .unwrap();
-
     // Grab existing nodes
-    let mut nodes: BTreeMap<_, _> = start_window
+    let mut nodes: BTreeMap<_, _> = Window::at_height(client.clone(), start_block)
+        .unwrap()
+        .unwrap()
         .nodes()
         .unwrap()
         .into_iter()
@@ -93,31 +91,39 @@ fn main() {
         .collect();
     println!("Found {} existing nodes", nodes.len());
 
+    let contract_search_start_block = if BLOCKS_IN_HOUR * 48 + 1 > start_block {
+        1
+    } else {
+        start_block - 48 * BLOCKS_IN_HOUR - 1
+    };
     // Grab existing contracts
-    let mut contracts: BTreeMap<_, _> = start_window
-        .contracts(true)
-        .unwrap()
-        .into_iter()
-        .filter_map(|contract| {
-            let contract = contract.unwrap();
-            // Namecontract is actually billed once deployed through a node contract.
-            if let ContractData::NodeContract(nc) = contract.contract_type {
-                Some((
-                    contract.contract_id,
-                    Contract {
-                        contract_id: contract.contract_id,
-                        node_id: nc.node_id,
-                        // a report should pop up for this
-                        last_report_ts: start_window.date().unwrap().timestamp(),
-                        last_reported_nru: 0,
-                        ips: nc.public_ips,
-                    },
-                ))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut contracts: BTreeMap<_, _> =
+        Window::at_height(client.clone(), contract_search_start_block)
+            .unwrap()
+            .unwrap()
+            .contracts(false)
+            .unwrap()
+            .into_iter()
+            .filter_map(|contract| {
+                let contract = contract.unwrap();
+                // Namecontract is actually billed once deployed through a node contract.
+                if let ContractData::NodeContract(nc) = contract.contract_type {
+                    Some((
+                        contract.contract_id,
+                        Contract {
+                            contract_id: contract.contract_id,
+                            node_id: nc.node_id,
+                            // a report should pop up for this
+                            last_report_ts: 0,
+                            last_reported_nru: 0,
+                            ips: nc.public_ips,
+                        },
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
     println!("Found {} existing contracts", contracts.len());
 
     // Fetch the last known consumption reports for the active contracts so we have a baseline to
@@ -125,13 +131,10 @@ fn main() {
     // This will be corrected by not gathering consumption reports after the period ends. So
     // essentially this small time window (max 1 hour) is covered in the next payout.
     println!("Extract consumption reports for existing contracts");
-    let consumption_blocks = block_import(
-        client.clone(),
-        start_block - BLOCKS_IN_HOUR - 1,
-        start_block - 1,
-    );
+    let consumption_blocks =
+        block_import(client.clone(), contract_search_start_block, start_block - 1);
 
-    let bar = ProgressBar::new(BLOCKS_IN_HOUR as u64);
+    let bar = ProgressBar::new((start_block - contract_search_start_block) as u64 + 1);
     bar.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] {wide_bar} {pos:>3}/{len:>3} (ETA: {eta_precise})"),
@@ -173,6 +176,17 @@ fn main() {
         bar.inc(1);
     }
     bar.finish_and_clear();
+
+    // Remove contracts that did not get updated
+    print!(
+        "Removing contracts without known reports, pre filter length {}",
+        contracts.len()
+    );
+    let mut contracts: BTreeMap<_, _> = contracts
+        .into_iter()
+        .filter(|(_, c)| c.last_report_ts != 0)
+        .collect();
+    println!(" post filter length {}", contracts.len());
 
     println!("Setup block import pipeline");
     let blocks = end_block - start_block + 1;
@@ -342,8 +356,18 @@ fn main() {
                                 )
                             }
                         };
-                        // Just to make sure
-                        assert!(report.timestamp as i64 > contract.last_report_ts);
+                        // Just to make sure reports are ordered
+                        if report.timestamp as i64 <= contract.last_report_ts {
+                            // Silently ignore reports out of order
+                            continue;
+                        }
+
+                        // If report ts predates start we just memorize it but don't give credit.
+                        if (report.timestamp as i64) < start_ts {
+                            contract.last_reported_nru = report.nru;
+                            contract.last_report_ts = report.timestamp as i64;
+                            continue;
+                        }
 
                         let time_elapsed = report.timestamp - contract.last_report_ts as u64;
                         node.capacity_consumption.cru += (report.cru * time_elapsed) as u128;
@@ -378,10 +402,13 @@ fn main() {
                             );
                         };
                     }
-                    SmartContractEvent::NodeContractCanceled(contract_id, _, _) => {
-                        let contract = contracts.remove(&contract_id);
-                        // This should be a known contract
-                        assert!(contract.is_some());
+                    SmartContractEvent::NodeContractCanceled(_, _, _) => {
+                        // We can't cancel the contract, as it might still receive a consumption
+                        // report. Technically we should check that only 1 final report is
+                        // received. But honestly it's the chain's job to make sure of that. Now,
+                        // considering IP, we will not do special handling, instead we rely on the
+                        // fact that IP reservations are only credited once a consumption report is
+                        // processed.
                     }
                     _ => {}
                 },
@@ -398,14 +425,20 @@ fn main() {
 
     bar.finish();
 
+    let period_duration = (end_ts - start_ts) as u64;
+
     // TODO: add consumption stats
-    println!("node_id,twin_id,farm_id,measured_uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,cru,mru,hru,sru,DIY state,violation");
+    println!("node_id,twin_id,farm_id,measured_uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,violation");
     for (_, node) in nodes {
         let (cu, su, nu) = node.cloud_units_permill();
         let musd = node.node_payout_musd();
         let tft = node.node_payout_tft_units();
+        let cru_used = (node.capacity_consumption.cru / period_duration as u128) as u64;
+        let mru_used = (node.capacity_consumption.mru / period_duration as u128) as u64;
+        let hru_used = (node.capacity_consumption.hru / period_duration as u128) as u64;
+        let sru_used = (node.capacity_consumption.sru / period_duration as u128) as u64;
         println!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{}",
             node.id,
             node.twin_id,
             node.farm_id,
@@ -425,9 +458,14 @@ fn main() {
                 node.connection_price % 1_000
             ),
             node.resources.cru,
+            cru_used as f64 * 100. / node.resources.cru as f64,
             node.resources.mru,
+            mru_used as f64 * 100. / node.resources.mru as f64,
             node.resources.hru,
+            hru_used as f64 * 100. / node.resources.hru as f64,
             node.resources.sru,
+            sru_used as f64 * 100. / node.resources.sru as f64,
+            node.capacity_consumption.ips as f64 / 3600.,
             if let CertificationType::Certified = node.certification_type {
                 "CERTIFIED"
             } else {
@@ -613,7 +651,7 @@ struct Contract {
 
 #[derive(Default)]
 struct TotalConsumption {
-    // cru mru hru sru and ips is value * time
+    // cru mru hru sru and ips is value * time i.e. unit seconds
     cru: u128,
     sru: u128,
     hru: u128,
