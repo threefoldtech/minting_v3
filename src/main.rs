@@ -1,12 +1,17 @@
+use crate::period::Period;
 use chrono::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
+use receipt::{CloudUnits, MintingReceipt, ResourceUnits, ResourceUtilization, Reward};
 use std::{collections::BTreeMap, sync::mpsc};
 use tfchain_client::{
     client::{Client, MultiSignature, Pair, SharedClient},
     events::{SmartContractEvent, TFGridEvent, TfchainEvent},
-    types::{BlockNumber, CertificationType, ContractData, Location, Resources},
+    types::{BlockNumber, CertificationType, ContractData, Farm, Location, Resources},
     window::Window,
 };
+
+mod period;
+mod receipt;
 
 const RPC_THREADS: usize = 100;
 const PRE_FETCH: usize = 5;
@@ -52,14 +57,18 @@ const CU_CARBON_OFFSET_MUSD: u64 = 354;
 /// sheet](https://docs.google.com/spreadsheets/d/16uUJEArEb-3aDkHNTlsMpMovyqgLp9xtwzdgjdu-lGw/edit#gid=1395768004)
 /// on 01-02-2022.
 const SU_CARBON_OFFSET_MUSD: u64 = 122;
+/// Required uptime percentage in a period for nodes to be eligible for rewards.
+/// TODO: verify
+const UPTIME_SLA_PERCENT: u64 = 95;
 
 fn main() {
     let mut args = std::env::args();
     // ignore binary name
     args.next();
 
-    let start_ts: i64 = args.next().unwrap().parse().unwrap();
-    let end_ts: i64 = args.next().unwrap().parse().unwrap();
+    let period = Period::at_offset(args.next().unwrap().parse().unwrap());
+    let start_ts: i64 = period.start();
+    let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
 
     let client = SharedClient::<sp_core::sr25519::Pair>::new(Client::new(wss_url, None));
@@ -100,6 +109,18 @@ fn main() {
         })
         .collect();
     println!("Found {} existing nodes", nodes.len());
+
+    let farms: BTreeMap<_, _> = Window::at_height(client.clone(), end_block)
+        .unwrap()
+        .unwrap()
+        .farms()
+        .unwrap()
+        .into_iter()
+        .map(|farm| {
+            let farm = farm.unwrap();
+            (farm.id, farm)
+        })
+        .collect();
 
     let contract_search_start_block = if BLOCKS_IN_HOUR * 48 + 1 > start_block {
         1
@@ -435,30 +456,35 @@ fn main() {
 
     bar.finish();
 
-    let period_duration = (end_ts - start_ts) as u64;
+    let mut receipts = BTreeMap::new();
 
-    // TODO: add consumption stats
-    println!("node_id,twin_id,farm_id,measured_uptime,CU,SU,NU,USD reward,TFT reward,carbon offset USD generated,carbon offset TFT generated,TFT price on connect,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,violation");
+    println!("node id,twin id,farm name (farm id),measured uptime,CU,SU,NU,USD reward,TFT reward,carbon offset USD generated,carbon offset TFT generated,TFT price on connect,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,violation");
     for (_, node) in nodes {
+        let node_period = node.real_period(period);
+        let node_period_duration = node_period.duration();
+        let node_start = Utc.timestamp(node_period.start(), 0);
+        let node_end = Utc.timestamp(node_period.end(), 0);
         let (cu, su, nu) = node.cloud_units_permill();
-        let musd = node.node_payout_musd();
-        let co_musd = node.node_carbon_musd();
-        let tft = node.node_payout_tft_units();
-        let co_tft = node.node_carbon_tft_units();
-        let cru_used = (node.capacity_consumption.cru / period_duration as u128) as u64;
-        let mru_used = (node.capacity_consumption.mru / period_duration as u128) as u64;
-        let hru_used = (node.capacity_consumption.hru / period_duration as u128) as u64;
-        let sru_used = (node.capacity_consumption.sru / period_duration as u128) as u64;
+        let (musd, tft) = node.scaled_payout(period);
+        let (co_musd, co_tft) = node.scaled_carbon_payout(period);
+        //let musd = node.node_payout_musd();
+        //let co_musd = node.node_carbon_musd();
+        //let tft = node.node_payout_tft_units();
+        //let co_tft = node.node_carbon_tft_units();
+        let cru_used = (node.capacity_consumption.cru / node_period_duration as u128) as u64;
+        let mru_used = (node.capacity_consumption.mru / node_period_duration as u128) as u64;
+        let hru_used = (node.capacity_consumption.hru / node_period_duration as u128) as u64;
+        let sru_used = (node.capacity_consumption.sru / node_period_duration as u128) as u64;
+        let farm = farms.get(&node.farm_id).unwrap();
         println!(
-            "{},{},{},{},{},{},{},{} $,{} TFT,{} USD,{} TFT,{} USD,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{}",
+            "{},{},{} ({}),{},{},{},{},{},{},{} $,{} TFT,{} USD,{} TFT,{} USD,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{}",
             node.id,
             node.twin_id,
+            farm.name,
             node.farm_id,
-            if let Some((_, _, uptime)) = node.uptime_info {
-                uptime
-            } else {
-                0
-            },
+            node_start,
+            node_end,
+            node.uptime(period),
             format_args!("{}.{:06}", cu / ONE_MILL as u64, cu % ONE_MILL as u64),
             format_args!("{}.{:06}", su / ONE_MILL as u64, su % ONE_MILL as u64),
             format_args!("{}.{:06}", nu / ONE_MILL as u64, nu % ONE_MILL as u64),
@@ -485,12 +511,22 @@ fn main() {
             } else {
                 "DIY"
             },
+            // TODO: stellar payout address
             if let Some(violation) = node.first_uptime_violation {
-                violation
+                format!("violaton of uptime measurement in block {}", violation)
             } else {
-                0
+                "".into()
             }
         );
+
+        let receipt = node.receipt(period, &farms);
+        receipts.insert(receipt.hash(), receipt);
+    }
+
+    use std::io::Write;
+    let f = std::fs::File::create("payouts.csv").unwrap();
+    for (hash, receipt) in receipts {
+        writeln!(f, "{},{}.{},{}", todo!());
     }
 }
 
@@ -670,6 +706,124 @@ impl MintingNode {
     /// Calculate the TFT payout generated by the node towards carbon offset.
     fn node_carbon_tft_units(&self) -> u64 {
         self.node_carbon_musd() * UNITS_PER_TFT / self.connection_price
+    }
+
+    /// Get the real period for the node given an observed period.
+    ///
+    /// If the node only came online in the observed period, then a period which starts at the
+    /// moment of connection will be returned.
+    fn real_period(&self, mut observed_period: Period) -> Period {
+        if let NodeConnected::Current(ts) = self.connected {
+            observed_period.scale_start(ts);
+        };
+        observed_period
+    }
+
+    fn receipt(&self, period: Period, farms: &BTreeMap<u32, Farm>) -> MintingReceipt {
+        let uptime = if let Some((_, _, uptime)) = self.uptime_info {
+            uptime
+        } else {
+            0
+        };
+        let farm = farms.get(&self.farm_id).unwrap();
+        let (cu, su, nu) = self.cloud_units_permill();
+        let cu = cu as f64 / ONE_MILL as f64;
+        let su = su as f64 / ONE_MILL as f64;
+        let nu = nu as f64 / ONE_MILL as f64;
+        let cru_used = (self.capacity_consumption.cru / period.duration() as u128) as u64;
+        let mru_used = (self.capacity_consumption.mru / period.duration() as u128) as u64;
+        let hru_used = (self.capacity_consumption.hru / period.duration() as u128) as u64;
+        let sru_used = (self.capacity_consumption.sru / period.duration() as u128) as u64;
+        let (musd, tft) = self.scaled_payout(period);
+        let (carbon_musd, carbon_tft) = self.scaled_carbon_payout(period);
+        MintingReceipt {
+            period: self.real_period(period),
+            node_id: self.id,
+            twin_id: self.twin_id,
+            farm_id: self.farm_id,
+            farm_name: farm.name.clone(),
+            stellar_payout_address: todo!(),
+            measured_uptime: uptime,
+            tft_connection_price: self.connection_price,
+            cloud_units: CloudUnits { cu, su, nu },
+            resource_units: ResourceUnits {
+                cru: self.resources.cru as f64 / GIB as f64,
+                mru: self.resources.mru as f64 / GIB as f64,
+                sru: self.resources.sru as f64 / GIB as f64,
+                hru: self.resources.hru as f64 / GIB as f64,
+            },
+            resource_utilization: ResourceUtilization {
+                cru: cru_used as f64 * 100. / self.resources.cru as f64,
+                mru: mru_used as f64 * 100. / self.resources.mru as f64,
+                sru: sru_used as f64 * 100. / self.resources.sru as f64,
+                hru: hru_used as f64 * 100. / self.resources.hru as f64,
+                ip: self.capacity_consumption.ips as f64 / 3600.,
+            },
+            reward: Reward { musd, tft },
+            carbon_offset: Reward {
+                musd: carbon_musd,
+                tft: carbon_tft,
+            },
+            node_type: match self.certification_type {
+                CertificationType::Diy => "DIY".into(),
+                CertificationType::Certified => "CERTIFIED".into(),
+            },
+        }
+    }
+
+    /// Indicates if a node managed to achieve it's SLA in a period.
+    ///
+    /// Currently SLA is the same for all nodes, this might change in the future.
+    fn sla_achieved(&self, period: Period) -> bool {
+        let scaled_period = self.real_period(period);
+        self.uptime(scaled_period) * 100 / scaled_period.duration() >= UPTIME_SLA_PERCENT
+    }
+
+    /// Get the adjusted uptime of the node
+    fn uptime(&self, period: Period) -> u64 {
+        let period_duration = self.real_period(period).duration();
+        if let Some((_, _, uptime)) = self.uptime_info {
+            std::cmp::min(uptime, period_duration)
+        } else {
+            0
+        }
+    }
+
+    /// Get the payout for a node in mUSD and units TFT for a period. This accounts for scaled
+    /// period due to connection time, and SLA
+    fn scaled_payout(&self, period: Period) -> (u64, u64) {
+        // If we did not manage to achieve SLA, don't bother
+        if !self.sla_achieved(period) {
+            return (0, 0);
+        }
+
+        let full_musd = self.node_payout_musd();
+        let full_tft = self.node_payout_tft_units();
+
+        let actual_period = self.real_period(period);
+        if actual_period != period {
+            return (
+                full_musd * actual_period.duration() / period.duration(),
+                full_tft * actual_period.duration() / period.duration(),
+            );
+        }
+
+        (full_musd, full_tft)
+    }
+
+    /// Get the carbon payout for a node in mUSD and units TFT for a period. This scales linearly with
+    /// uptime of the node. Importantly, this does not scale with the connection time, as carbon
+    /// untis are expressed for a whole duration.
+    fn scaled_carbon_payout(&self, period: Period) -> (u64, u64) {
+        let musd = self.node_carbon_musd();
+        let tft = self.node_carbon_tft_units();
+        let period_duration = period.duration();
+        let uptime = self.uptime(period);
+
+        (
+            musd * uptime / period_duration,
+            tft * uptime / period_duration,
+        )
     }
 }
 
