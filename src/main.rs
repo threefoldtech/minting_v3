@@ -137,10 +137,10 @@ fn main() {
         })
         .collect();
 
-    let contract_search_start_block = if BLOCKS_IN_HOUR * 48 + 1 > start_block {
+    let contract_search_start_block = if BLOCKS_IN_HOUR * 72 + 1 > start_block {
         1
     } else {
-        start_block - 48 * BLOCKS_IN_HOUR - 1
+        start_block - 72 * BLOCKS_IN_HOUR - 1
     };
     // Grab existing contracts
     let mut contracts: BTreeMap<_, _> =
