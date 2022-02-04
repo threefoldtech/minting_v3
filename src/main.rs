@@ -498,6 +498,10 @@ fn main() {
                 if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
                     node.uptime_info
                 {
+                    // only collect 1 uptime event after the period ended
+                    if last_reported_at >= end_ts {
+                        continue;
+                    }
                     let report_delta = current_time as i64 - last_reported_at;
                     let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
                     // There are quite some situations here. Notice that due to the
@@ -526,7 +530,10 @@ fn main() {
                         if uptime_delta > 0 {
                             // Simply add the uptime delta. If this is too large or low by a
                             // couple of seconds it will be corrected by the next pings anyhow.
-                            total_uptime += uptime_delta as u64;
+                            //
+                            // Make sure we don't add too much based on the period.
+                            let delta_in_period = end_ts - last_reported_at;
+                            total_uptime += delta_in_period as u64;
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, total_uptime));
                             continue;
@@ -539,7 +546,11 @@ fn main() {
                     //
                     //    1. Uptime is within bounds.
                     if reported_uptime as i64 <= report_delta {
-                        total_uptime += reported_uptime;
+                        // Account for the fact that we are actually out of the period
+                        let out_of_period = current_time - end_ts as u64;
+                        if out_of_period < reported_uptime {
+                            total_uptime += reported_uptime - out_of_period;
+                        }
                         node.uptime_info =
                             Some((current_time as i64, reported_uptime, total_uptime));
                         continue;
