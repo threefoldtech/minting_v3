@@ -695,23 +695,33 @@ where
         let (tx, rx) = mpsc::sync_channel(PRE_FETCH);
         receivers.push(rx);
         let client = client.clone();
-        let mut window = Window::at_height(client, start + i as u32)
-            .unwrap()
-            .unwrap();
+        let mut height = start + i as u32;
         std::thread::spawn(move || loop {
-            let height = window.height().unwrap();
             if height > end {
                 break;
             }
-            let timestamp = window.date().unwrap();
-            let events = window.events().unwrap();
+            let window = match Window::at_height(client.clone(), height) {
+                Ok(maybe_window) => maybe_window.unwrap(),
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
+            };
+            let timestamp = match window.date() {
+                Ok(ts) => ts,
+                Err(_) => continue,
+            };
+            let events = match window.events() {
+                Ok(evt) => evt,
+                Err(_) => continue,
+            };
             tx.send(MintingBlock {
                 height,
                 timestamp,
                 events,
             })
             .unwrap();
-            window = window.advance_by(RPC_THREADS as u32).unwrap().unwrap();
+            height += RPC_THREADS as u32;
         });
     }
 
