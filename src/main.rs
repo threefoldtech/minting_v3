@@ -1,8 +1,9 @@
 use crate::period::Period;
+use blake2::{digest::consts::U32, Blake2b, Digest};
 use chrono::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use receipt::{CloudUnits, MintingReceipt, ResourceUnits, ResourceUtilization, Reward};
-use std::{collections::BTreeMap, sync::mpsc};
+use std::{collections::BTreeMap, io::Write, sync::mpsc};
 use tfchain_client::{
     client::{Client, MultiSignature, Pair, SharedClient},
     events::{SmartContractEvent, TFGridEvent, TfchainEvent},
@@ -60,6 +61,9 @@ const SU_CARBON_OFFSET_MUSD: u64 = 122;
 /// Required uptime percentage in a period for nodes to be eligible for rewards.
 /// TODO: verify
 const UPTIME_SLA_PERCENT: u64 = 95;
+/// The address to which the carbon credit tft will be sent.
+/// Value provided by Andreas Hartl in a Telegram DM on 03-02-2022
+const CARBON_CREDIT_ADDRESS: &str = "GDIJY6K2BBRIRX423ZFUYKKFDN66XP2KMSBZFQSE2PSNDZ6EDVQTRLSU";
 
 fn main() {
     let mut args = std::env::args();
@@ -110,15 +114,26 @@ fn main() {
         .collect();
     println!("Found {} existing nodes", nodes.len());
 
-    let farms: BTreeMap<_, _> = Window::at_height(client.clone(), end_block)
+    let farm_window = Window::at_height(client.clone(), end_block)
         .unwrap()
-        .unwrap()
+        .unwrap();
+
+    let farms: BTreeMap<_, _> = farm_window
         .farms()
         .unwrap()
         .into_iter()
         .map(|farm| {
             let farm = farm.unwrap();
             (farm.id, farm)
+        })
+        .collect();
+
+    let payout_addresses: BTreeMap<_, _> = farms
+        .iter()
+        .map(|(id, _)| (id, farm_window.farm_payout_address(*id).unwrap()))
+        .filter_map(|(id, address)| match address {
+            Some(address) => Some((*id, address)),
+            None => None,
         })
         .collect();
 
@@ -457,8 +472,11 @@ fn main() {
     bar.finish();
 
     let mut receipts = BTreeMap::new();
+    let mut payout_file = std::fs::File::create("payouts.csv").unwrap();
 
-    println!("node id,twin id,farm name (farm id),measured uptime,CU,SU,NU,USD reward,TFT reward,carbon offset USD generated,carbon offset TFT generated,TFT price on connect,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,violation");
+    let mut carbon_tft_units = 0;
+
+    println!("node id,twin id,farm name (farm id),measured uptime,CU,SU,NU,USD reward,TFT reward,carbon offset USD generated,carbon offset TFT generated,TFT price on connect,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,violation,stellar address");
     for (_, node) in nodes {
         let node_period = node.real_period(period);
         let node_period_duration = node_period.duration();
@@ -476,8 +494,13 @@ fn main() {
         let hru_used = (node.capacity_consumption.hru / node_period_duration as u128) as u64;
         let sru_used = (node.capacity_consumption.sru / node_period_duration as u128) as u64;
         let farm = farms.get(&node.farm_id).unwrap();
+        let stellar_address = if let Some(stellar_address) = payout_addresses.get(&node.farm_id) {
+            &stellar_address
+        } else {
+            ""
+        };
         println!(
-            "{},{},{} ({}),{},{},{},{},{},{},{} $,{} TFT,{} USD,{} TFT,{} USD,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{}",
+            "{},{},{} ({}),{},{},{},{},{},{},{} $,{} TFT,{} USD,{} TFT,{} USD,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{},{}",
             node.id,
             node.twin_id,
             farm.name,
@@ -511,22 +534,58 @@ fn main() {
             } else {
                 "DIY"
             },
-            // TODO: stellar payout address
             if let Some(violation) = node.first_uptime_violation {
                 format!("violaton of uptime measurement in block {}", violation)
             } else {
                 "".into()
-            }
+            },
+            stellar_address,
         );
 
-        let receipt = node.receipt(period, &farms);
+        let receipt = node.receipt(period, &farms, &payout_addresses);
+        if stellar_address != "" {
+            writeln!(
+                payout_file,
+                "{},{}.{:07},{}",
+                stellar_address,
+                tft / UNITS_PER_TFT,
+                tft % UNITS_PER_TFT,
+                hex::encode(receipt.hash()),
+            )
+            .unwrap();
+        }
         receipts.insert(receipt.hash(), receipt);
+
+        carbon_tft_units += node.node_carbon_tft_units();
     }
 
-    use std::io::Write;
-    let f = std::fs::File::create("payouts.csv").unwrap();
+    // TODO: carbon credit payout
+    // Sort hashes in lexicographical order
+    let mut receipt_hashes = receipts.keys().cloned().collect::<Vec<_>>();
+    receipt_hashes.sort();
+    let mut hasher = Blake2b::<U32>::new();
+    for receipt_hash in receipt_hashes {
+        hasher.update(receipt_hash);
+    }
+    let carbon_hash: [u8; 32] = hasher.finalize().into();
+    writeln!(
+        payout_file,
+        "{},{}.{:07},{}",
+        CARBON_CREDIT_ADDRESS,
+        carbon_tft_units / UNITS_PER_TFT,
+        carbon_tft_units % UNITS_PER_TFT,
+        hex::encode(carbon_hash),
+    )
+    .unwrap();
+
+    // Write generated receipts
+    std::fs::create_dir_all("./receipts").unwrap();
     for (hash, receipt) in receipts {
-        writeln!(f, "{},{}.{},{}", todo!());
+        std::fs::write(
+            format!("./receipts/{}", hex::encode(hash)),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
     }
 }
 
@@ -719,7 +778,12 @@ impl MintingNode {
         observed_period
     }
 
-    fn receipt(&self, period: Period, farms: &BTreeMap<u32, Farm>) -> MintingReceipt {
+    fn receipt(
+        &self,
+        period: Period,
+        farms: &BTreeMap<u32, Farm>,
+        payout_addresses: &BTreeMap<u32, String>,
+    ) -> MintingReceipt {
         let uptime = if let Some((_, _, uptime)) = self.uptime_info {
             uptime
         } else {
@@ -736,13 +800,17 @@ impl MintingNode {
         let sru_used = (self.capacity_consumption.sru / period.duration() as u128) as u64;
         let (musd, tft) = self.scaled_payout(period);
         let (carbon_musd, carbon_tft) = self.scaled_carbon_payout(period);
+        let payout_address = match payout_addresses.get(&self.farm_id) {
+            Some(address) => address,
+            None => "",
+        };
         MintingReceipt {
             period: self.real_period(period),
             node_id: self.id,
             twin_id: self.twin_id,
             farm_id: self.farm_id,
             farm_name: farm.name.clone(),
-            stellar_payout_address: todo!(),
+            stellar_payout_address: payout_address.to_string(),
             measured_uptime: uptime,
             tft_connection_price: self.connection_price,
             cloud_units: CloudUnits { cu, su, nu },
