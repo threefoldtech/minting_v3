@@ -564,10 +564,11 @@ fn main() {
 
     let mut receipts = BTreeMap::new();
     let mut payout_file = std::fs::File::create("payouts.csv").unwrap();
+    let mut overview_file = std::fs::File::create("overview.csv").unwrap();
 
     let mut carbon_tft_units = 0;
 
-    println!("node id,twin id,farm name (farm id),measured uptime,CU,SU,NU,USD reward,TFT reward,carbon offset USD generated,carbon offset TFT generated,TFT price on connect,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,violation,stellar address");
+    writeln!(overview_file,"node id,twin id,farm name (farm id),period start,period end,measured uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,carbon offset USD generated,carbon offset TFT generated,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,violation,stellar address").unwrap();
     for (_, node) in nodes {
         let node_period = node.real_period(period);
         let node_period_duration = node_period.duration();
@@ -590,8 +591,8 @@ fn main() {
         } else {
             ""
         };
-        println!(
-            "{},{},{} ({}),{},{},{},{},{},{},{} $,{} TFT,{} USD,{} TFT,{} USD,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{},{}",
+        writeln!(overview_file,
+            "{},{},{} ({}),{},{},{},{},{},{},{} $,{} TFT,{} $,{} TFT,{} $,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{},{}",
             node.id,
             node.twin_id,
             farm.name,
@@ -631,7 +632,7 @@ fn main() {
                 "".into()
             },
             stellar_address,
-        );
+        ).unwrap();
 
         let receipt = node.receipt(period, &farms, &payout_addresses);
         if !stellar_address.is_empty() && tft != 0 {
@@ -647,7 +648,8 @@ fn main() {
         }
         receipts.insert(receipt.hash(), receipt);
 
-        carbon_tft_units += node.node_carbon_tft_units();
+        // Count carbon TFT credits
+        carbon_tft_units += co_tft;
     }
 
     // TODO: carbon credit payout
