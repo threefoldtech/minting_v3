@@ -236,7 +236,7 @@ fn main() {
 
     println!("Setup block import pipeline");
     let blocks = end_block - start_block + 1;
-    let block_import = block_import(client, start_block, end_block);
+    let block_stream = block_import(client.clone(), start_block, end_block);
 
     let bar = ProgressBar::new(blocks as u64);
     bar.set_style(
@@ -244,7 +244,7 @@ fn main() {
             .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
     );
     let mut last_height = start_block - 1;
-    for block in block_import {
+    for block in block_stream {
         assert_eq!(block.height, last_height + 1);
 
         for event in block.events {
@@ -470,6 +470,97 @@ fn main() {
     }
 
     bar.finish();
+
+    println!("Getting uptime info from post period");
+    let block_stream = block_import(client, end_block, end_block + BLOCKS_IN_HOUR * 2);
+    let bar = ProgressBar::new(BLOCKS_IN_HOUR as u64 * 2);
+    bar.set_style(
+        ProgressStyle::default_bar()
+            .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
+    );
+
+    for block in block_stream {
+        for event in block.events {
+            if let TfchainEvent::TFGrid(TFGridEvent::NodeUptimeReported(
+                id,
+                current_time,
+                reported_uptime,
+            )) = event
+            {
+                // Sanity check the event, this should not be needed
+                assert_eq!(current_time as i64, block.timestamp.timestamp());
+                let node = match nodes.get_mut(&id) {
+                    Some(node) => node,
+                    None => panic!(
+                        "can't report uptime for unknown node {} in block {}",
+                        id, block.height
+                    ),
+                };
+                if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
+                    node.uptime_info
+                {
+                    let report_delta = current_time as i64 - last_reported_at;
+                    let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
+                    // There are quite some situations here. Notice that due to the
+                    // blockchain only producing blocks every 6 seconds, and network delay
+                    // + a host of other issues, we will allow a node to report uptime with
+                    // "grace period" of a minute or so in either direction.
+                    //
+                    // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
+                    //    rubish.
+                    if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
+                        // If we already have an uptime violation we don't care anymore.
+                        if node.first_uptime_violation.is_none() {
+                            node.first_uptime_violation = Some(block.height);
+                        }
+                        continue;
+                    }
+                    // 2. The difference in uptime is within reason of the difference in
+                    //    report times, i.e. the node is properly reporting.
+                    if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
+                        && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+                    {
+                        // It is technically possible for the delta to be less than 0 and
+                        // within the expected time frame. If nodes boot, send uptime, then
+                        // immediately reboot that is possible. In those cases, handle that
+                        // below, as that is the reboot detection.
+                        if uptime_delta > 0 {
+                            // Simply add the uptime delta. If this is too large or low by a
+                            // couple of seconds it will be corrected by the next pings anyhow.
+                            total_uptime += uptime_delta as u64;
+                            node.uptime_info =
+                                Some((current_time as i64, reported_uptime, total_uptime));
+                            continue;
+                        }
+                    }
+                    // 3. The difference in uptime is too low. Again there are multiple
+                    //    scenarios. Either way we consider the node rebooted. Depending on
+                    //    the reported uptime, the node reports legit uptime, or it reports
+                    //    an uptime which is too high.
+                    //
+                    //    1. Uptime is within bounds.
+                    if reported_uptime as i64 <= report_delta {
+                        total_uptime += reported_uptime;
+                        node.uptime_info =
+                            Some((current_time as i64, reported_uptime, total_uptime));
+                        continue;
+                    }
+                    //    2. Uptime is too high, this is garbage
+                    if node.first_uptime_violation.is_none() {
+                        node.first_uptime_violation = Some(block.height);
+                        continue;
+                    }
+
+                    // We should have handled all cases. Make this explicit here.
+                    unreachable!();
+                }
+            }
+        }
+
+        bar.set_message(block.timestamp.to_rfc2822());
+        bar.inc(1)
+    }
+    bar.finish_and_clear();
 
     let mut receipts = BTreeMap::new();
     let mut payout_file = std::fs::File::create("payouts.csv").unwrap();
