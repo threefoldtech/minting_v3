@@ -634,7 +634,7 @@ fn main() {
         );
 
         let receipt = node.receipt(period, &farms, &payout_addresses);
-        if stellar_address != "" {
+        if !stellar_address.is_empty() && tft != 0 {
             writeln!(
                 payout_file,
                 "{},{}.{:07},{}",
@@ -653,7 +653,7 @@ fn main() {
     // TODO: carbon credit payout
     // Sort hashes in lexicographical order
     let mut receipt_hashes = receipts.keys().cloned().collect::<Vec<_>>();
-    receipt_hashes.sort();
+    receipt_hashes.sort_unstable();
     let mut hasher = Blake2b::<U32>::new();
     for receipt_hash in receipt_hashes {
         hasher.update(receipt_hash);
