@@ -491,10 +491,9 @@ fn main() {
                 assert_eq!(current_time as i64, block.timestamp.timestamp());
                 let node = match nodes.get_mut(&id) {
                     Some(node) => node,
-                    None => panic!(
-                        "can't report uptime for unknown node {} in block {}",
-                        id, block.height
-                    ),
+                    // This is possible if its an uptime report for a node which came online after
+                    // the period ended
+                    None => continue,
                 };
                 if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
                     node.uptime_info
