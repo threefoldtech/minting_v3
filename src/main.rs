@@ -64,13 +64,21 @@ const UPTIME_SLA_PERCENT: u64 = 95;
 /// The address to which the carbon credit tft will be sent.
 /// Value provided by Andreas Hartl in a Telegram DM on 03-02-2022
 const CARBON_CREDIT_ADDRESS: &str = "GDIJY6K2BBRIRX423ZFUYKKFDN66XP2KMSBZFQSE2PSNDZ6EDVQTRLSU";
+/// Unix timestamp of the start of 29th of january 2022, GMT timezone
+const LAST_DAY_START_TS: i64 = 1643414400;
+/// Amount of seconds in six hours
+const SIX_HOURS: u64 = 60 * 60 * 6;
 
 fn main() {
     let mut args = std::env::args();
     // ignore binary name
     args.next();
 
-    let period = Period::at_offset(args.next().unwrap().parse().unwrap());
+    let period_id: i64 = args.next().unwrap().parse().unwrap();
+    if period_id != 45 {
+        panic!("Can only use this binary for period 45");
+    }
+    let period = Period::at_offset(period_id);
     let start_ts: i64 = period.start();
     let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
@@ -108,6 +116,7 @@ fn main() {
                     connected: NodeConnected::Old,
                     connection_price: DAO_CONNECTION_PRICE_MUSD,
                     capacity_consumption: TotalConsumption::default(),
+                    was_online_29: false,
                 },
             )
         })
@@ -268,6 +277,7 @@ fn main() {
                                 connected: NodeConnected::Current(block.timestamp.timestamp()),
                                 connection_price: DAO_CONNECTION_PRICE_MUSD,
                                 capacity_consumption: TotalConsumption::default(),
+                                was_online_29: false,
                             },
                         );
                     }
@@ -313,6 +323,9 @@ fn main() {
                                 id, block.height
                             ),
                         };
+                        if current_time as i64 >= LAST_DAY_START_TS {
+                            node.was_online_29 = true;
+                        }
                         if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
                             node.uptime_info
                         {
@@ -537,6 +550,7 @@ fn main() {
                             // Make sure we don't add too much based on the period.
                             let delta_in_period = end_ts - last_reported_at;
                             total_uptime += delta_in_period as u64;
+                            node.was_online_29 = true;
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, total_uptime));
                             continue;
@@ -552,6 +566,7 @@ fn main() {
                         // Account for the fact that we are actually out of the period
                         let out_of_period = current_time - end_ts as u64;
                         if out_of_period < reported_uptime {
+                            node.was_online_29 = true;
                             total_uptime += reported_uptime - out_of_period;
                         }
                         node.uptime_info =
@@ -794,6 +809,7 @@ struct MintingNode {
     connection_price: u64,
     // capacity consumed by workloads over a period.
     capacity_consumption: TotalConsumption,
+    was_online_29: bool,
 }
 
 impl MintingNode {
@@ -889,7 +905,9 @@ impl MintingNode {
     /// moment of connection will be returned.
     fn real_period(&self, mut observed_period: Period) -> Period {
         if let NodeConnected::Current(ts) = self.connected {
-            observed_period.scale_start(ts);
+            if !self.was_online_29 {
+                observed_period.scale_start(ts);
+            }
         };
         observed_period
     }
@@ -959,6 +977,9 @@ impl MintingNode {
     ///
     /// Currently SLA is the same for all nodes, this might change in the future.
     fn sla_achieved(&self, period: Period) -> bool {
+        if self.was_online_29 {
+            return self.uptime(period) > SIX_HOURS;
+        }
         let scaled_period = self.real_period(period);
         self.uptime(scaled_period) * 100 / scaled_period.duration() >= UPTIME_SLA_PERCENT
     }
