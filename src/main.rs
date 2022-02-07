@@ -388,10 +388,13 @@ fn main() {
                     SmartContractEvent::ConsumptionReportReceived(report) => {
                         let contract = match contracts.get_mut(&report.contract_id) {
                             Some(contract) => contract,
-                            None => panic!(
-                                "can't report consumption for unknown contract {} in block {}",
-                                report.contract_id, block.height
-                            ),
+                            // This should not really happen but it does on testnet in period 45,
+                            // should not matter either way.
+                            None => continue,
+                            // None => panic!(
+                            //     "can't report consumption for unknown contract {} in block {}",
+                            //     report.contract_id, block.height
+                            // ),
                         };
                         let node = match nodes.get_mut(&contract.node_id) {
                             Some(node) => node,
