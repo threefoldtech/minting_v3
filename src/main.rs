@@ -3,16 +3,21 @@ use blake2::{digest::consts::U32, Blake2b, Digest};
 use chrono::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use receipt::{CloudUnits, MintingReceipt, ResourceUnits, ResourceUtilization, Reward};
-use std::{collections::BTreeMap, io::Write, sync::mpsc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::Write,
+    sync::mpsc,
+};
 use tfchain_client::{
     client::{Client, MultiSignature, Pair, SharedClient},
     events::{SmartContractEvent, TFGridEvent, TfchainEvent},
     types::{BlockNumber, CertificationType, ContractData, Farm, Location, Resources},
-    window::Window,
+    window::{Network, Window},
 };
 
 mod period;
 mod receipt;
+mod stellar;
 
 const RPC_THREADS: usize = 100;
 const PRE_FETCH: usize = 5;
@@ -64,8 +69,14 @@ const UPTIME_SLA_PERCENT: u64 = 95;
 /// The address to which the carbon credit tft will be sent.
 /// Value provided by Andreas Hartl in a Telegram DM on 03-02-2022
 const CARBON_CREDIT_ADDRESS: &str = "GDIJY6K2BBRIRX423ZFUYKKFDN66XP2KMSBZFQSE2PSNDZ6EDVQTRLSU";
+/// Address of horizon server to use
+const HORIZON_URL: &str = "https://stellar-mainnet.grid.tf";
 
 fn main() {
+    let horizon = stellar::Horizon::new(HORIZON_URL);
+    horizon.filter_previous_mints::<()>(&mut HashMap::new());
+    // TODO
+    let network = Network::Main;
     let mut args = std::env::args();
     // ignore binary name
     args.next();
@@ -75,7 +86,10 @@ fn main() {
     let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
 
-    let client = SharedClient::<sp_core::sr25519::Pair>::new(Client::new(wss_url, None));
+    let client =
+        SharedClient::<sp_core::sr25519::Pair, tfchain_client::runtimes::runtime::Event>::new(
+            Client::new(wss_url, None),
+        );
 
     println!("Finding start block");
     let start_block = client.height_at_timestamp(start_ts).unwrap();
@@ -83,7 +97,7 @@ fn main() {
     let end_block = client.height_at_timestamp(end_ts).unwrap();
 
     // Grab existing nodes
-    let mut nodes: BTreeMap<_, _> = Window::at_height(client.clone(), start_block)
+    let mut nodes: BTreeMap<_, _> = Window::at_height(client.clone(), start_block, network)
         .unwrap()
         .unwrap()
         .nodes()
@@ -108,13 +122,14 @@ fn main() {
                     connected: NodeConnected::Old,
                     connection_price: DAO_CONNECTION_PRICE_MUSD,
                     capacity_consumption: TotalConsumption::default(),
+                    virtualized: node.virtualized,
                 },
             )
         })
         .collect();
     println!("Found {} existing nodes", nodes.len());
 
-    let farm_window = Window::at_height(client.clone(), end_block)
+    let farm_window = Window::at_height(client.clone(), end_block, network)
         .unwrap()
         .unwrap();
 
@@ -144,7 +159,7 @@ fn main() {
     };
     // Grab existing contracts
     let mut contracts: BTreeMap<_, _> =
-        Window::at_height(client.clone(), contract_search_start_block)
+        Window::at_height(client.clone(), contract_search_start_block, network)
             .unwrap()
             .unwrap()
             .contracts(false)
@@ -177,8 +192,12 @@ fn main() {
     // This will be corrected by not gathering consumption reports after the period ends. So
     // essentially this small time window (max 1 hour) is covered in the next payout.
     println!("Extract consumption reports for existing contracts");
-    let consumption_blocks =
-        block_import(client.clone(), contract_search_start_block, start_block - 1);
+    let consumption_blocks = block_import(
+        client.clone(),
+        contract_search_start_block,
+        start_block - 1,
+        network,
+    );
 
     let bar = ProgressBar::new((start_block - contract_search_start_block) as u64 - 1);
     bar.set_style(
@@ -236,7 +255,7 @@ fn main() {
 
     println!("Setup block import pipeline");
     let blocks = end_block - start_block + 1;
-    let block_stream = block_import(client.clone(), start_block, end_block);
+    let block_stream = block_import(client.clone(), start_block, end_block, network);
 
     let bar = ProgressBar::new(blocks as u64);
     bar.set_style(
@@ -249,7 +268,7 @@ fn main() {
 
         for event in block.events {
             match event {
-                TfchainEvent::TFGrid(grid_event) => match grid_event {
+                TfchainEvent::TFGrid(grid_event) => match *grid_event {
                     TFGridEvent::NodeStored(node) => {
                         nodes.insert(
                             node.id,
@@ -268,6 +287,7 @@ fn main() {
                                 connected: NodeConnected::Current(block.timestamp.timestamp()),
                                 connection_price: DAO_CONNECTION_PRICE_MUSD,
                                 capacity_consumption: TotalConsumption::default(),
+                                virtualized: node.virtualized,
                             },
                         );
                     }
@@ -365,11 +385,8 @@ fn main() {
                             //    2. Uptime is too high, this is garbage
                             if node.first_uptime_violation.is_none() {
                                 node.first_uptime_violation = Some(block.height);
-                                continue;
                             }
-
-                            // We should have handled all cases. Make this explicit here.
-                            unreachable!();
+                            continue;
                         } else {
                             let period_duration = current_time as i64 - start_ts;
                             // Make sure we don't give more credit than the current length of the
@@ -475,7 +492,7 @@ fn main() {
     bar.finish();
 
     println!("Getting uptime info from post period");
-    let block_stream = block_import(client, end_block, end_block + BLOCKS_IN_HOUR * 2);
+    let block_stream = block_import(client, end_block, end_block + BLOCKS_IN_HOUR * 2, network);
     let bar = ProgressBar::new(BLOCKS_IN_HOUR as u64 * 2);
     bar.set_style(
         ProgressStyle::default_bar()
@@ -484,88 +501,85 @@ fn main() {
 
     for block in block_stream {
         for event in block.events {
-            if let TfchainEvent::TFGrid(TFGridEvent::NodeUptimeReported(
-                id,
-                current_time,
-                reported_uptime,
-            )) = event
-            {
-                // Sanity check the event, this should not be needed
-                assert_eq!(current_time as i64, block.timestamp.timestamp());
-                let node = match nodes.get_mut(&id) {
-                    Some(node) => node,
-                    // This is possible if its an uptime report for a node which came online after
-                    // the period ended
-                    None => continue,
-                };
-                if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
-                    node.uptime_info
-                {
-                    // only collect 1 uptime event after the period ended
-                    if last_reported_at >= end_ts {
-                        continue;
-                    }
-                    let report_delta = current_time as i64 - last_reported_at;
-                    let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
-                    // There are quite some situations here. Notice that due to the
-                    // blockchain only producing blocks every 6 seconds, and network delay
-                    // + a host of other issues, we will allow a node to report uptime with
-                    // "grace period" of a minute or so in either direction.
-                    //
-                    // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
-                    //    rubish.
-                    if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                        // If we already have an uptime violation we don't care anymore.
-                        if node.first_uptime_violation.is_none() {
-                            node.first_uptime_violation = Some(block.height);
-                        }
-                        continue;
-                    }
-                    // 2. The difference in uptime is within reason of the difference in
-                    //    report times, i.e. the node is properly reporting.
-                    if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
-                        && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+            if let TfchainEvent::TFGrid(event) = event {
+                if let TFGridEvent::NodeUptimeReported(id, current_time, reported_uptime) = *event {
+                    // Sanity check the event, this should not be needed
+                    assert_eq!(current_time as i64, block.timestamp.timestamp());
+                    let node = match nodes.get_mut(&id) {
+                        Some(node) => node,
+                        // This is possible if its an uptime report for a node which came online after
+                        // the period ended
+                        None => continue,
+                    };
+                    if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
+                        node.uptime_info
                     {
-                        // It is technically possible for the delta to be less than 0 and
-                        // within the expected time frame. If nodes boot, send uptime, then
-                        // immediately reboot that is possible. In those cases, handle that
-                        // below, as that is the reboot detection.
-                        if uptime_delta > 0 {
-                            // Simply add the uptime delta. If this is too large or low by a
-                            // couple of seconds it will be corrected by the next pings anyhow.
-                            //
-                            // Make sure we don't add too much based on the period.
-                            let delta_in_period = end_ts - last_reported_at;
-                            total_uptime += delta_in_period as u64;
+                        // only collect 1 uptime event after the period ended
+                        if last_reported_at >= end_ts {
+                            continue;
+                        }
+                        let report_delta = current_time as i64 - last_reported_at;
+                        let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
+                        // There are quite some situations here. Notice that due to the
+                        // blockchain only producing blocks every 6 seconds, and network delay
+                        // + a host of other issues, we will allow a node to report uptime with
+                        // "grace period" of a minute or so in either direction.
+                        //
+                        // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
+                        //    rubish.
+                        if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
+                            // If we already have an uptime violation we don't care anymore.
+                            if node.first_uptime_violation.is_none() {
+                                node.first_uptime_violation = Some(block.height);
+                            }
+                            continue;
+                        }
+                        // 2. The difference in uptime is within reason of the difference in
+                        //    report times, i.e. the node is properly reporting.
+                        if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
+                            && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+                        {
+                            // It is technically possible for the delta to be less than 0 and
+                            // within the expected time frame. If nodes boot, send uptime, then
+                            // immediately reboot that is possible. In those cases, handle that
+                            // below, as that is the reboot detection.
+                            if uptime_delta > 0 {
+                                // Simply add the uptime delta. If this is too large or low by a
+                                // couple of seconds it will be corrected by the next pings anyhow.
+                                //
+                                // Make sure we don't add too much based on the period.
+                                let delta_in_period = end_ts - last_reported_at;
+                                total_uptime += delta_in_period as u64;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                continue;
+                            }
+                        }
+                        // 3. The difference in uptime is too low. Again there are multiple
+                        //    scenarios. Either way we consider the node rebooted. Depending on
+                        //    the reported uptime, the node reports legit uptime, or it reports
+                        //    an uptime which is too high.
+                        //
+                        //    1. Uptime is within bounds.
+                        if reported_uptime as i64 <= report_delta {
+                            // Account for the fact that we are actually out of the period
+                            let out_of_period = current_time - end_ts as u64;
+                            if out_of_period < reported_uptime {
+                                total_uptime += reported_uptime - out_of_period;
+                            }
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, total_uptime));
                             continue;
                         }
-                    }
-                    // 3. The difference in uptime is too low. Again there are multiple
-                    //    scenarios. Either way we consider the node rebooted. Depending on
-                    //    the reported uptime, the node reports legit uptime, or it reports
-                    //    an uptime which is too high.
-                    //
-                    //    1. Uptime is within bounds.
-                    if reported_uptime as i64 <= report_delta {
-                        // Account for the fact that we are actually out of the period
-                        let out_of_period = current_time - end_ts as u64;
-                        if out_of_period < reported_uptime {
-                            total_uptime += reported_uptime - out_of_period;
+                        //    2. Uptime is too high, this is garbage
+                        if node.first_uptime_violation.is_none() {
+                            node.first_uptime_violation = Some(block.height);
+                            continue;
                         }
-                        node.uptime_info =
-                            Some((current_time as i64, reported_uptime, total_uptime));
-                        continue;
-                    }
-                    //    2. Uptime is too high, this is garbage
-                    if node.first_uptime_violation.is_none() {
-                        node.first_uptime_violation = Some(block.height);
-                        continue;
-                    }
 
-                    // We should have handled all cases. Make this explicit here.
-                    unreachable!();
+                        // We should have handled all cases. Make this explicit here.
+                        unreachable!();
+                    }
                 }
             }
         }
@@ -581,7 +595,7 @@ fn main() {
 
     let mut carbon_tft_units = 0;
 
-    writeln!(overview_file,"node id,twin id,farm name (farm id),period start,period end,measured uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,carbon offset USD generated,carbon offset TFT generated,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,violation,stellar address").unwrap();
+    writeln!(overview_file,"node id,twin id,farm name (farm id),period start,period end,measured uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,carbon offset USD generated,carbon offset TFT generated,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,Virtualized,violation,stellar address").unwrap();
     for (_, node) in nodes {
         let node_period = node.real_period(period);
         let node_period_duration = node_period.duration();
@@ -605,7 +619,7 @@ fn main() {
             ""
         };
         writeln!(overview_file,
-            "{},{},{} ({}),{},{},{},{},{},{},{} $,{} TFT,{} $,{} $,{} TFT,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{},{}",
+            "{},{},{} ({}),{},{},{},{},{},{},{} $,{} TFT,{} $,{} $,{} TFT,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{},{},{}",
             node.id,
             node.twin_id,
             farm.name,
@@ -639,6 +653,7 @@ fn main() {
             } else {
                 "DIY"
             },
+            node.virtualized,
             if let Some(violation) = node.first_uptime_violation {
                 format!("violaton of uptime measurement in block {}", violation)
             } else {
@@ -695,14 +710,18 @@ fn main() {
     }
 }
 
-fn block_import<P>(
-    client: SharedClient<P>,
+fn block_import<P, E>(
+    client: SharedClient<P, E>,
     start: BlockNumber,
     end: BlockNumber,
+    network: tfchain_client::window::Network,
 ) -> mpsc::Receiver<MintingBlock>
 where
     P: Pair,
     MultiSignature: From<P::Signature>,
+    E: tfchain_client::support::sp_runtime::traits::Member + tfchain_client::support::Parameter,
+    TfchainEvent: From<E>,
+    tfchain_client::window::EventTypedClient<P>: From<SharedClient<P, E>>,
 {
     let mut receivers = Vec::with_capacity(RPC_THREADS);
 
@@ -715,7 +734,7 @@ where
             if height > end {
                 break;
             }
-            let window = match Window::at_height(client.clone(), height) {
+            let window = match Window::at_height(client.clone(), height, network) {
                 Ok(maybe_window) => maybe_window.unwrap(),
                 Err(_) => {
                     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -794,6 +813,7 @@ struct MintingNode {
     connection_price: u64,
     // capacity consumed by workloads over a period.
     capacity_consumption: TotalConsumption,
+    virtualized: bool,
 }
 
 impl MintingNode {
@@ -840,7 +860,12 @@ impl MintingNode {
     ///     + IP used * IP REWARD
     ///
     /// Additionally, "certified" nodes get 25% extra.
+    ///
+    /// A virtualized node (i.e. zos running in VM) won't get anything.
     fn node_payout_musd(&self) -> u64 {
+        if self.virtualized {
+            return 0;
+        }
         let (cu, su, nu) = self.cloud_units_permill();
         let cu_reward = cu * CU_REWARD_MUSD;
         let su_reward = su * SU_REWARD_MUSD;
@@ -870,7 +895,12 @@ impl MintingNode {
     /// definition without aggregating the blocks of a period. Also, this definition comes from a
     /// random google sheet somewhere as specified in the constants used. If you expected proper
     /// specifications, boy you came to the wrong place.
+    ///
+    /// A virtualized node is garbage so that does not receive anything.
     fn node_carbon_musd(&self) -> u64 {
+        if self.virtualized {
+            return 0;
+        }
         let (cu, su, _) = self.cloud_units_permill();
         let cu_payout = cu * CU_CARBON_OFFSET_MUSD;
         let su_payout = su * SU_CARBON_OFFSET_MUSD;
