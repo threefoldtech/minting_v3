@@ -38,13 +38,17 @@ impl Horizon {
                 let (_, resp) = self.client.request(req).await.unwrap();
                 for tx in &resp.records {
                     // TODO:
-                    //   - memo hash
                     //   - b64 decode memo
                     //   - remove entry from mint map
                     if tx.memo_type != "hash" {
                         continue;
                     }
-                    println!("{:#?}", tx);
+                    // infallible
+                    if let Some(ref memo) = tx.memo {
+                        let mut hash = [0; 32];
+                        base64::decode_config_slice(memo, base64::STANDARD, &mut hash).unwrap();
+                        mint_map.remove(&hash);
+                    }
                 }
                 if resp.records.len() < PAGE_LIMIT as usize {
                     break;

@@ -73,3 +73,28 @@ pub struct ResourceUtilization {
     pub sru: f64,
     pub ip: f64,
 }
+
+#[derive(Serialize, Deserialize)]
+/// A receipt which will be stored to validate the payout of a node. This will then be hashed to
+/// create the payment memo.
+///
+/// Note that this only makes sense for valid mints, hence there is no error field here.
+pub struct RetryPayoutReceipt {
+    pub failed_payout_period: Period,
+    pub retry_period: Period,
+    pub farm_id: u32,
+    pub previous_stellar_payout_address: String,
+    pub stellar_payout_address: String,
+    pub retry_for_receipt: String,
+    pub reward: Reward,
+}
+
+impl RetryPayoutReceipt {
+    /// Get the hash of the receipt.
+    pub fn hash(&self) -> [u8; 32] {
+        let out = serde_json::to_vec(&self).unwrap();
+        let mut hasher = Blake2b256::new();
+        hasher.update(out);
+        hasher.finalize().into()
+    }
+}
