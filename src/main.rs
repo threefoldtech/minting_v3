@@ -1,11 +1,14 @@
-use crate::period::Period;
+use crate::{period::Period, receipt::RetryPayoutReceipt};
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use chrono::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use receipt::{CloudUnits, MintingReceipt, ResourceUnits, ResourceUtilization, Reward};
 use std::{
     collections::{BTreeMap, HashMap},
+    fs,
     io::Write,
+    os::unix::prelude::OsStrExt,
+    path,
     sync::mpsc,
 };
 use tfchain_client::{
@@ -73,18 +76,58 @@ const CARBON_CREDIT_ADDRESS: &str = "GDIJY6K2BBRIRX423ZFUYKKFDN66XP2KMSBZFQSE2PS
 const HORIZON_URL: &str = "https://stellar-mainnet.grid.tf";
 
 fn main() {
-    let horizon = stellar::Horizon::new(HORIZON_URL);
-    horizon.filter_previous_mints::<()>(&mut HashMap::new());
     // TODO
     let network = Network::Main;
     let mut args = std::env::args();
     // ignore binary name
     args.next();
 
-    let period = Period::at_offset(args.next().unwrap().parse().unwrap());
+    let period_offset = args.next().unwrap().parse().unwrap();
+    let period = Period::at_offset(period_offset);
     let start_ts: i64 = period.start();
     let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
+
+    // load previous receipts
+    let previous_period_offset = period_offset - 1;
+    println!("Loading receipts from period {}", previous_period_offset);
+    let mut previous_receipt_dir = path::PathBuf::new();
+    previous_receipt_dir.push("receipts");
+    previous_receipt_dir.push(previous_period_offset.to_string());
+
+    let mut previous_receipts = HashMap::new();
+
+    match std::fs::read_dir(&previous_receipt_dir) {
+        Err(_) => println!("Previous receipt dir does not exist, skip loading receipts"),
+        Ok(dir_iter) => {
+            for file in dir_iter {
+                let file = file.unwrap();
+                if !file.file_type().unwrap().is_file() {
+                    continue;
+                }
+                let mut hash = [0; 32];
+                hex::decode_to_slice(file.file_name().as_bytes(), &mut hash).unwrap();
+                let mut path = previous_receipt_dir.clone();
+                path.push(file.file_name());
+                let data = fs::read_to_string(path).unwrap();
+                let receipt: MintingReceipt = serde_json::from_str(&data).unwrap();
+                previous_receipts.insert(hash, receipt);
+            }
+        }
+    }
+
+    if previous_receipts.len() > 0 {
+        println!(
+            "Filtering receipts, pre filter length {}",
+            previous_receipts.len()
+        );
+        let horizon = stellar::Horizon::new(HORIZON_URL);
+        horizon.filter_previous_mints(&mut previous_receipts);
+        println!(
+            "Done filtering receipts, post filter length {}",
+            previous_receipts.len()
+        );
+    }
 
     let client =
         SharedClient::<sp_core::sr25519::Pair, tfchain_client::runtimes::runtime::Event>::new(
@@ -592,6 +635,7 @@ fn main() {
     let mut receipts = BTreeMap::new();
     let mut payout_file = std::fs::File::create("payouts.csv").unwrap();
     let mut overview_file = std::fs::File::create("overview.csv").unwrap();
+    let mut retry_file = std::fs::File::create("retries.csv").unwrap();
 
     let mut carbon_tft_units = 0;
 
@@ -640,13 +684,13 @@ fn main() {
             format_args!("{}.{:03}", co_musd / 1_000, co_musd % 1_000),
             format_args!("{}.{:07}", co_tft / UNITS_PER_TFT, co_tft % UNITS_PER_TFT),
             node.resources.cru,
-            cru_used as f64 * 100. / node.resources.cru as f64,
+            if node.resources.cru > 0 {cru_used as f64 * 100. / node.resources.cru as f64} else { 0.},
             node.resources.mru,
-            mru_used as f64 * 100. / node.resources.mru as f64,
+            if node.resources.mru > 0 {mru_used as f64 * 100. / node.resources.mru as f64} else {0.},
             node.resources.hru,
-            hru_used as f64 * 100. / node.resources.hru as f64,
+            if node.resources.hru > 0 {hru_used as f64 * 100. / node.resources.hru as f64} else {0.},
             node.resources.sru,
-            sru_used as f64 * 100. / node.resources.sru as f64,
+            if node.resources.sru > 0 {sru_used as f64 * 100. / node.resources.sru as f64} else {0.},
             node.capacity_consumption.ips as f64 / 3600.,
             if let CertificationType::Certified = node.certification_type {
                 "CERTIFIED"
@@ -680,6 +724,38 @@ fn main() {
         carbon_tft_units += co_tft;
     }
 
+    // Retry payments once
+    let mut retry_receipts = HashMap::new();
+    for (hash, failed_receipt) in previous_receipts {
+        let retry_receipt = RetryPayoutReceipt {
+            failed_payout_period: failed_receipt.period,
+            retry_period: period,
+            farm_id: failed_receipt.farm_id,
+            previous_stellar_payout_address: failed_receipt.stellar_payout_address,
+            stellar_payout_address: payout_addresses
+                .get(&failed_receipt.farm_id)
+                .map(|a| a.clone())
+                .unwrap_or("".to_string()),
+            retry_for_receipt: hex::encode(hash),
+            reward: failed_receipt.reward,
+        };
+        let retry_hash = hex::encode(retry_receipt.hash());
+
+        if !retry_receipt.stellar_payout_address.is_empty() && retry_receipt.reward.tft != 0 {
+            writeln!(
+                payout_file,
+                "{},{}.{:07},{}",
+                retry_receipt.stellar_payout_address,
+                retry_receipt.reward.tft / UNITS_PER_TFT,
+                retry_receipt.reward.tft % UNITS_PER_TFT,
+                retry_hash,
+            )
+            .unwrap();
+        }
+
+        retry_receipts.insert(retry_hash, retry_receipt);
+    }
+
     // TODO: carbon credit payout
     // Sort hashes in lexicographical order
     let mut receipt_hashes = receipts.keys().cloned().collect::<Vec<_>>();
@@ -700,13 +776,42 @@ fn main() {
     .unwrap();
 
     // Write generated receipts
-    std::fs::create_dir_all("./receipts").unwrap();
+    let mut receipt_dir = path::PathBuf::new();
+    receipt_dir.push("receipts");
+    receipt_dir.push(period_offset.to_string());
+    std::fs::create_dir_all(&receipt_dir).unwrap();
     for (hash, receipt) in receipts {
-        std::fs::write(
-            format!("./receipts/{}", hex::encode(hash)),
-            serde_json::to_vec(&receipt).unwrap(),
+        let mut path = receipt_dir.clone();
+        path.push(hex::encode(hash));
+        std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    }
+
+    // Write retry receipts
+    writeln!(
+        retry_file,
+        "farm_id,previous_stellar_address,new_stellar_address,amount TFT,retry_for",
+    )
+    .unwrap();
+    let mut retry_receipt_dir = path::PathBuf::new();
+    retry_receipt_dir.push("receipts");
+    retry_receipt_dir.push("retries");
+    retry_receipt_dir.push(period_offset.to_string());
+    std::fs::create_dir_all(&retry_receipt_dir).unwrap();
+    for (hash, receipt) in retry_receipts {
+        writeln!(
+            retry_file,
+            "{},{},{},{}.{:07},{}",
+            receipt.farm_id,
+            receipt.previous_stellar_payout_address,
+            receipt.stellar_payout_address,
+            receipt.reward.tft / UNITS_PER_TFT,
+            receipt.reward.tft % UNITS_PER_TFT,
+            receipt.retry_for_receipt,
         )
         .unwrap();
+        let mut path = retry_receipt_dir.clone();
+        path.push(hash);
+        std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
     }
 }
 
@@ -863,7 +968,7 @@ impl MintingNode {
     ///
     /// A virtualized node (i.e. zos running in VM) won't get anything.
     fn node_payout_musd(&self) -> u64 {
-        if self.virtualized {
+        if self.virtualized || self.first_uptime_violation.is_some() {
             return 0;
         }
         let (cu, su, nu) = self.cloud_units_permill();
@@ -898,7 +1003,7 @@ impl MintingNode {
     ///
     /// A virtualized node is garbage so that does not receive anything.
     fn node_carbon_musd(&self) -> u64 {
-        if self.virtualized {
+        if self.virtualized || self.first_uptime_violation.is_some() {
             return 0;
         }
         let (cu, su, _) = self.cloud_units_permill();
@@ -967,10 +1072,26 @@ impl MintingNode {
                 hru: self.resources.hru as f64 / GIB as f64,
             },
             resource_utilization: ResourceUtilization {
-                cru: cru_used as f64 * 100. / self.resources.cru as f64,
-                mru: mru_used as f64 * 100. / self.resources.mru as f64,
-                sru: sru_used as f64 * 100. / self.resources.sru as f64,
-                hru: hru_used as f64 * 100. / self.resources.hru as f64,
+                cru: if self.resources.cru > 0 {
+                    cru_used as f64 * 100. / self.resources.cru as f64
+                } else {
+                    0.
+                },
+                mru: if self.resources.mru > 0 {
+                    mru_used as f64 * 100. / self.resources.mru as f64
+                } else {
+                    0.
+                },
+                sru: if self.resources.sru > 0 {
+                    sru_used as f64 * 100. / self.resources.sru as f64
+                } else {
+                    0.
+                },
+                hru: if self.resources.hru > 0 {
+                    hru_used as f64 * 100. / self.resources.hru as f64
+                } else {
+                    0.
+                },
                 ip: self.capacity_consumption.ips as f64 / 3600.,
             },
             reward: Reward { musd, tft },
