@@ -24,7 +24,7 @@ mod stellar;
 
 const RPC_THREADS: usize = 100;
 const PRE_FETCH: usize = 5;
-const UPTIME_GRACE_PERIOD_SECONDS: i64 = 60;
+const UPTIME_GRACE_PERIOD_SECONDS: i64 = 300; // 5 Minutes
 const GIB: u128 = 1024 * 1024 * 1024;
 const ONE_MILL: u128 = 1_000_000;
 /// Reward for 1 CU per period in mUSD.
@@ -77,7 +77,7 @@ const HORIZON_URL: &str = "https://stellar-mainnet.grid.tf";
 
 fn main() {
     // TODO
-    let network = Network::Main;
+    let network = Network::Test;
     let mut args = std::env::args();
     // ignore binary name
     args.next();
@@ -365,6 +365,11 @@ fn main() {
                         // uptime_info. The reboot will be detected in the `NodeUptimeReported`
                         // handler.
                         // This does not change when the node was connected.
+                        //
+                        // Once a VM, always a VM
+                        if node.virtualized {
+                            old_node.virtualized = node.virtualized;
+                        }
                     }
                     TFGridEvent::NodeUptimeReported(id, current_time, reported_uptime) => {
                         // Sanity check the event, this should not be needed
@@ -699,7 +704,7 @@ fn main() {
             },
             node.virtualized,
             if let Some(violation) = node.first_uptime_violation {
-                format!("violaton of uptime measurement in block {}", violation)
+                format!("violation of uptime measurement in block {}", violation)
             } else {
                 "".into()
             },
@@ -727,6 +732,10 @@ fn main() {
     // Retry payments once
     let mut retry_receipts = HashMap::new();
     for (hash, failed_receipt) in previous_receipts {
+        // no point in doing this
+        if failed_receipt.reward.tft == 0 {
+            continue;
+        }
         let retry_receipt = RetryPayoutReceipt {
             failed_payout_period: failed_receipt.period,
             retry_period: period,
