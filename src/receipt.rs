@@ -102,7 +102,7 @@ impl RetryPayoutReceipt {
 #[derive(Serialize, Deserialize)]
 /// A receipt to correct underpayment of nodes in february 2022.
 pub struct FixupReceipt {
-    pub perod: Period,
+    pub period: Period,
     pub node_id: u32,
     pub farm_id: u32,
     pub previous_calculated_cu: f64,
