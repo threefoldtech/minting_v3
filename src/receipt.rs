@@ -105,13 +105,16 @@ pub struct FixupReceipt {
     pub perod: Period,
     pub node_id: u32,
     pub farm_id: u32,
-    pub stellar_payout_address: String,
-    pub incorrect_receipt: String,
-    pub received_payout: Reward,
-    pub correct_payout: Reward,
-    pub fixup_payout: Reward,
     pub previous_calculated_cu: f64,
     pub actual_cu: f64,
+    pub stellar_payout_address: String,
+    pub incorrect_receipt: String,
+    pub minted_payout: Reward,
+    pub correct_payout: Reward,
+    pub fixup_payout: Reward,
+    pub minted_carbon_offset: Reward,
+    pub correct_carbon_offset: Reward,
+    pub fixup_carbon_offset: Reward,
 }
 
 impl FixupReceipt {
