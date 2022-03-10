@@ -1075,7 +1075,7 @@ impl MintingNode {
             tft_connection_price: self.connection_price,
             cloud_units: CloudUnits { cu, su, nu },
             resource_units: ResourceUnits {
-                cru: self.resources.cru as f64 / GIB as f64,
+                cru: self.resources.cru as f64,
                 mru: self.resources.mru as f64 / GIB as f64,
                 sru: self.resources.sru as f64 / GIB as f64,
                 hru: self.resources.hru as f64 / GIB as f64,
