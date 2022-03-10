@@ -98,3 +98,28 @@ impl RetryPayoutReceipt {
         hasher.finalize().into()
     }
 }
+
+#[derive(Serialize, Deserialize)]
+/// A receipt to correct underpayment of nodes in february 2022.
+pub struct FixupReceipt {
+    pub perod: Period,
+    pub node_id: u32,
+    pub farm_id: u32,
+    pub stellar_payout_address: String,
+    pub incorrect_receipt: String,
+    pub received_payout: Reward,
+    pub correct_payout: Reward,
+    pub fixup_payout: Reward,
+    pub previous_calculated_cu: f64,
+    pub actual_cu: f64,
+}
+
+impl FixupReceipt {
+    /// Get the hash of the receipt.
+    pub fn hash(&self) -> [u8; 32] {
+        let out = serde_json::to_vec(&self).unwrap();
+        let mut hasher = Blake2b256::new();
+        hasher.update(out);
+        hasher.finalize().into()
+    }
+}
