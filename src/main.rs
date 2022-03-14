@@ -57,17 +57,16 @@ const UNITS_PER_TFT: u64 = 10_000_000;
 /// The amount of blocks expected in an hour.
 const BLOCKS_IN_HOUR: u32 = 10 * 60; // 10 blocks per minute
 /// The price of 1 CU related to carbon offset.
-/// Value taken from [a random google
-/// sheet](https://docs.google.com/spreadsheets/d/16uUJEArEb-3aDkHNTlsMpMovyqgLp9xtwzdgjdu-lGw/edit#gid=1395768004)
+/// Value taken from [this]
+/// (https://docs.google.com/spreadsheets/d/16uUJEArEb-3aDkHNTlsMpMovyqgLp9xtwzdgjdu-lGw/edit#gid=1395768004)
 /// on 01-02-2022.
 const CU_CARBON_OFFSET_MUSD: u64 = 354;
 /// The price of 1 SU related to carbon offset
-/// Value taken from [a random google
-/// sheet](https://docs.google.com/spreadsheets/d/16uUJEArEb-3aDkHNTlsMpMovyqgLp9xtwzdgjdu-lGw/edit#gid=1395768004)
+/// Value taken from [this]
+/// (https://docs.google.com/spreadsheets/d/16uUJEArEb-3aDkHNTlsMpMovyqgLp9xtwzdgjdu-lGw/edit#gid=1395768004)
 /// on 01-02-2022.
 const SU_CARBON_OFFSET_MUSD: u64 = 122;
 /// Required uptime percentage in a period for nodes to be eligible for rewards.
-/// TODO: verify
 const UPTIME_SLA_PERCENT: u64 = 95;
 /// The address to which the carbon credit tft will be sent.
 /// Value provided by Andreas Hartl in a Telegram DM on 03-02-2022
@@ -76,8 +75,8 @@ const CARBON_CREDIT_ADDRESS: &str = "GDIJY6K2BBRIRX423ZFUYKKFDN66XP2KMSBZFQSE2PS
 const HORIZON_URL: &str = "https://stellar-mainnet.grid.tf";
 
 fn main() {
-    // TODO
-    let network = Network::Test;
+    // TODO: use `clap` to properly have flags for this
+    let network = Network::Main;
     let mut args = std::env::args();
     // ignore binary name
     args.next();
@@ -172,6 +171,8 @@ fn main() {
         .collect();
     println!("Found {} existing nodes", nodes.len());
 
+    // Load farms at the end of the period. This means we don't have to parse individual farm
+    // events, as we can just fetch the last known state.
     let farm_window = Window::at_height(client.clone(), end_block, network)
         .unwrap()
         .unwrap();
@@ -343,7 +344,6 @@ fn main() {
                         // update resources, but only lower them in case of dead or removed
                         // hardware. Do not update in case of added hardware as this is currently
                         // unresolved.
-                        // TODO: how to handle.
                         old_node.resources.cru =
                             std::cmp::min(old_node.resources.cru, node.resources.cru);
                         old_node.resources.mru =
@@ -389,7 +389,7 @@ fn main() {
                             // There are quite some situations here. Notice that due to the
                             // blockchain only producing blocks every 6 seconds, and network delay
                             // + a host of other issues, we will allow a node to report uptime with
-                            // "grace period" of a minute or so in either direction.
+                            // "grace period" of a couple of minutes or so in either direction.
                             //
                             // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
                             //    rubish.
@@ -439,7 +439,6 @@ fn main() {
                             let period_duration = current_time as i64 - start_ts;
                             // Make sure we don't give more credit than the current length of the
                             // period.
-                            // TODO: make sure this still works if we prefetch blocks for contracts
                             let up_in_period =
                                 std::cmp::min(period_duration as u64, reported_uptime);
                             // Save uptime info
@@ -453,13 +452,11 @@ fn main() {
                     SmartContractEvent::ConsumptionReportReceived(report) => {
                         let contract = match contracts.get_mut(&report.contract_id) {
                             Some(contract) => contract,
-                            // This should not really happen but it does on testnet in period 45,
-                            // should not matter either way.
+                            // Contract needs to exist. This might be triggered if an ancient
+                            // contract gets updated, which means it did not even get an update in
+                            // the time between loading the contract and the start of the period.
+                            // This indicates capacity which is not used anyhow, so we ignore that.
                             None => continue,
-                            // None => panic!(
-                            //     "can't report consumption for unknown contract {} in block {}",
-                            //     report.contract_id, block.height
-                            // ),
                         };
                         let node = match nodes.get_mut(&contract.node_id) {
                             Some(node) => node,
@@ -472,7 +469,9 @@ fn main() {
                         };
                         // Just to make sure reports are ordered
                         if report.timestamp as i64 <= contract.last_report_ts {
-                            // Silently ignore reports out of order
+                            // Silently ignore reports out of order, we already covered this in an
+                            // already processed consumption report. This can happen if the node pushes
+                            // a contract consumption report twice.
                             continue;
                         }
 
@@ -765,7 +764,6 @@ fn main() {
         retry_receipts.insert(retry_hash, retry_receipt);
     }
 
-    // TODO: carbon credit payout
     // Sort hashes in lexicographical order
     let mut receipt_hashes = receipts.keys().cloned().collect::<Vec<_>>();
     receipt_hashes.sort_unstable();
@@ -1006,9 +1004,7 @@ impl MintingNode {
     /// Calculate the amount of mUSD generated by the node for carbon offset.
     ///
     /// This is solely based on the CU and SU, therefore it can be calculated from just the node
-    /// definition without aggregating the blocks of a period. Also, this definition comes from a
-    /// random google sheet somewhere as specified in the constants used. If you expected proper
-    /// specifications, boy you came to the wrong place.
+    /// definition without aggregating the blocks of a period.
     ///
     /// A virtualized node is garbage so that does not receive anything.
     fn node_carbon_musd(&self) -> u64 {
