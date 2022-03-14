@@ -1,4 +1,4 @@
-use crate::{period::Period, receipt::RetryPayoutReceipt};
+use crate::{period::Period, receipt::FixupReceipt, receipt::RetryPayoutReceipt};
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use chrono::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -77,25 +77,28 @@ const HORIZON_URL: &str = "https://stellar-mainnet.grid.tf";
 
 fn main() {
     // TODO
-    let network = Network::Test;
+    let network = Network::Main;
     let mut args = std::env::args();
     // ignore binary name
     args.next();
 
     let period_offset = args.next().unwrap().parse().unwrap();
+    if period_offset != 46 {
+        panic!("This binary can only be used for period 46");
+    }
     let period = Period::at_offset(period_offset);
     let start_ts: i64 = period.start();
     let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
 
     // load previous receipts
-    let previous_period_offset = period_offset - 1;
+    let previous_period_offset = period_offset;
     println!("Loading receipts from period {}", previous_period_offset);
     let mut previous_receipt_dir = path::PathBuf::new();
     previous_receipt_dir.push("receipts");
     previous_receipt_dir.push(previous_period_offset.to_string());
 
-    let mut previous_receipts = HashMap::new();
+    let mut previous_receipts = BTreeMap::new();
 
     match std::fs::read_dir(&previous_receipt_dir) {
         Err(_) => println!("Previous receipt dir does not exist, skip loading receipts"),
@@ -111,22 +114,11 @@ fn main() {
                 path.push(file.file_name());
                 let data = fs::read_to_string(path).unwrap();
                 let receipt: MintingReceipt = serde_json::from_str(&data).unwrap();
-                previous_receipts.insert(hash, receipt);
+                // Sanity check
+                assert_eq!(hash, receipt.hash());
+                previous_receipts.insert(receipt.node_id, receipt);
             }
         }
-    }
-
-    if previous_receipts.len() > 0 {
-        println!(
-            "Filtering receipts, pre filter length {}",
-            previous_receipts.len()
-        );
-        let horizon = stellar::Horizon::new(HORIZON_URL);
-        horizon.filter_previous_mints(&mut previous_receipts);
-        println!(
-            "Done filtering receipts, post filter length {}",
-            previous_receipts.len()
-        );
     }
 
     let client =
@@ -640,129 +632,83 @@ fn main() {
     let mut receipts = BTreeMap::new();
     let mut payout_file = std::fs::File::create("payouts.csv").unwrap();
     let mut overview_file = std::fs::File::create("overview.csv").unwrap();
-    let mut retry_file = std::fs::File::create("retries.csv").unwrap();
 
     let mut carbon_tft_units = 0;
 
-    writeln!(overview_file,"node id,twin id,farm name (farm id),period start,period end,measured uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,carbon offset USD generated,carbon offset TFT generated,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,Virtualized,violation,stellar address").unwrap();
+    assert_eq!(previous_receipts.len(), nodes.len());
+
+    writeln!(overview_file, "node id,farm id,period start, period end,previous cu,previous su,previous nu,actual cu,actual su,actual nu,missing cu,missing su,missing nu,minted tft,actual tft,missing tft,minted carbon tft,actual carbon tft,missing carbon tft,minted receipt").unwrap();
+
     for (_, node) in nodes {
-        let node_period = node.real_period(period);
-        let node_period_duration = node_period.duration();
-        let node_start = Utc.timestamp(node_period.start(), 0);
-        let node_end = Utc.timestamp(node_period.end(), 0);
-        let (cu, su, nu) = node.cloud_units_permill();
-        let (musd, tft) = node.scaled_payout(period);
-        let (co_musd, co_tft) = node.scaled_carbon_payout(period);
-        //let musd = node.node_payout_musd();
-        //let co_musd = node.node_carbon_musd();
-        //let tft = node.node_payout_tft_units();
-        //let co_tft = node.node_carbon_tft_units();
-        let cru_used = (node.capacity_consumption.cru / node_period_duration as u128) as u64;
-        let mru_used = (node.capacity_consumption.mru / node_period_duration as u128) as u64;
-        let hru_used = (node.capacity_consumption.hru / node_period_duration as u128) as u64;
-        let sru_used = (node.capacity_consumption.sru / node_period_duration as u128) as u64;
-        let farm = farms.get(&node.farm_id).unwrap();
-        let stellar_address = if let Some(stellar_address) = payout_addresses.get(&node.farm_id) {
-            &stellar_address
-        } else {
-            ""
-        };
-        writeln!(overview_file,
-            "{},{},{} ({}),{},{},{},{},{},{},{} $,{} TFT,{} $,{} $,{} TFT,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{},{},{}",
-            node.id,
-            node.twin_id,
-            farm.name,
-            node.farm_id,
-            node_start,
-            node_end,
-            node.uptime(period),
-            format_args!("{}.{:06}", cu / ONE_MILL as u64, cu % ONE_MILL as u64),
-            format_args!("{}.{:06}", su / ONE_MILL as u64, su % ONE_MILL as u64),
-            format_args!("{}.{:06}", nu / ONE_MILL as u64, nu % ONE_MILL as u64),
-            format_args!("{}.{:03}", musd / 1_000, musd % 1_000),
-            format_args!("{}.{:07}", tft / UNITS_PER_TFT, tft % UNITS_PER_TFT),
-            format_args!(
-                "{}.{:03}",
-                node.connection_price / 1_000,
-                node.connection_price % 1_000
-            ),
-            format_args!("{}.{:03}", co_musd / 1_000, co_musd % 1_000),
-            format_args!("{}.{:07}", co_tft / UNITS_PER_TFT, co_tft % UNITS_PER_TFT),
-            node.resources.cru,
-            if node.resources.cru > 0 {cru_used as f64 * 100. / node.resources.cru as f64} else { 0.},
-            node.resources.mru,
-            if node.resources.mru > 0 {mru_used as f64 * 100. / node.resources.mru as f64} else {0.},
-            node.resources.hru,
-            if node.resources.hru > 0 {hru_used as f64 * 100. / node.resources.hru as f64} else {0.},
-            node.resources.sru,
-            if node.resources.sru > 0 {sru_used as f64 * 100. / node.resources.sru as f64} else {0.},
-            node.capacity_consumption.ips as f64 / 3600.,
-            if let CertificationType::Certified = node.certification_type {
-                "CERTIFIED"
-            } else {
-                "DIY"
-            },
-            node.virtualized,
-            if let Some(violation) = node.first_uptime_violation {
-                format!("violation of uptime measurement in block {}", violation)
-            } else {
-                "".into()
-            },
-            stellar_address,
-        ).unwrap();
+        let proper_receipt = node.receipt(period, &farms, &payout_addresses);
+        let old_receipt = previous_receipts
+            .get(&node.id)
+            .expect("there should be an old receipt for this node");
 
-        let receipt = node.receipt(period, &farms, &payout_addresses);
-        if !stellar_address.is_empty() && tft != 0 {
+        let fixup = FixupReceipt {
+            period: node.real_period(period),
+            node_id: node.id,
+            farm_id: node.farm_id,
+            minted_cloud_units: old_receipt.cloud_units,
+            correct_cloud_units: proper_receipt.cloud_units,
+            fixup_cloud_units: proper_receipt.cloud_units - old_receipt.cloud_units,
+            stellar_payout_address: proper_receipt.stellar_payout_address.clone(),
+            minted_receipt: hex::encode(old_receipt.hash()),
+            correct_receipt: hex::encode(proper_receipt.hash()),
+            minted_reward: old_receipt.reward,
+            correct_reward: proper_receipt.reward,
+            fixup_reward: proper_receipt.reward - old_receipt.reward,
+            minted_carbon_offset: old_receipt.carbon_offset,
+            correct_carbon_offset: proper_receipt.carbon_offset,
+            fixup_carbon_offset: proper_receipt.carbon_offset - old_receipt.carbon_offset,
+        };
+        writeln!(
+            overview_file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}.{:07},{}.{:07},{}.{:07},{}.{:07},{}.{:07},{}.{:07},{}",
+            fixup.node_id,
+            fixup.farm_id,
+            Utc.timestamp(fixup.period.start(), 0),
+            Utc.timestamp(fixup.period.end(), 0),
+            fixup.minted_cloud_units.cu,
+            fixup.minted_cloud_units.su,
+            fixup.minted_cloud_units.nu,
+            fixup.correct_cloud_units.cu,
+            fixup.correct_cloud_units.su,
+            fixup.correct_cloud_units.nu,
+            fixup.fixup_cloud_units.cu,
+            fixup.fixup_cloud_units.su,
+            fixup.fixup_cloud_units.nu,
+            fixup.minted_reward.tft / UNITS_PER_TFT as u64,
+            fixup.minted_reward.tft % UNITS_PER_TFT as u64,
+            fixup.correct_reward.tft / UNITS_PER_TFT as u64,
+            fixup.correct_reward.tft % UNITS_PER_TFT as u64,
+            fixup.fixup_reward.tft / UNITS_PER_TFT as u64,
+            fixup.fixup_reward.tft % UNITS_PER_TFT as u64,
+            fixup.minted_carbon_offset.tft / UNITS_PER_TFT as u64,
+            fixup.minted_carbon_offset.tft % UNITS_PER_TFT as u64,
+            fixup.correct_carbon_offset.tft / UNITS_PER_TFT as u64,
+            fixup.correct_carbon_offset.tft % UNITS_PER_TFT as u64,
+            fixup.fixup_carbon_offset.tft / UNITS_PER_TFT as u64,
+            fixup.fixup_carbon_offset.tft % UNITS_PER_TFT as u64,
+            fixup.minted_receipt,
+        )
+        .unwrap();
+
+        carbon_tft_units += fixup.fixup_carbon_offset.tft;
+
+        if !fixup.stellar_payout_address.is_empty() && fixup.fixup_reward.tft != 0 {
             writeln!(
                 payout_file,
                 "{},{}.{:07},{}",
-                stellar_address,
-                tft / UNITS_PER_TFT,
-                tft % UNITS_PER_TFT,
-                hex::encode(receipt.hash()),
-            )
-            .unwrap();
-        }
-        receipts.insert(receipt.hash(), receipt);
-
-        // Count carbon TFT credits
-        carbon_tft_units += co_tft;
-    }
-
-    // Retry payments once
-    let mut retry_receipts = HashMap::new();
-    for (hash, failed_receipt) in previous_receipts {
-        // no point in doing this
-        if failed_receipt.reward.tft == 0 {
-            continue;
-        }
-        let retry_receipt = RetryPayoutReceipt {
-            failed_payout_period: failed_receipt.period,
-            retry_period: period,
-            farm_id: failed_receipt.farm_id,
-            previous_stellar_payout_address: failed_receipt.stellar_payout_address,
-            stellar_payout_address: payout_addresses
-                .get(&failed_receipt.farm_id)
-                .map(|a| a.clone())
-                .unwrap_or("".to_string()),
-            retry_for_receipt: hex::encode(hash),
-            reward: failed_receipt.reward,
-        };
-        let retry_hash = hex::encode(retry_receipt.hash());
-
-        if !retry_receipt.stellar_payout_address.is_empty() && retry_receipt.reward.tft != 0 {
-            writeln!(
-                payout_file,
-                "{},{}.{:07},{}",
-                retry_receipt.stellar_payout_address,
-                retry_receipt.reward.tft / UNITS_PER_TFT,
-                retry_receipt.reward.tft % UNITS_PER_TFT,
-                retry_hash,
+                fixup.stellar_payout_address,
+                fixup.fixup_reward.tft / UNITS_PER_TFT,
+                fixup.fixup_reward.tft % UNITS_PER_TFT,
+                hex::encode(fixup.hash()),
             )
             .unwrap();
         }
 
-        retry_receipts.insert(retry_hash, retry_receipt);
+        receipts.insert(hex::encode(fixup.hash()), fixup);
     }
 
     // TODO: carbon credit payout
@@ -787,38 +733,11 @@ fn main() {
     // Write generated receipts
     let mut receipt_dir = path::PathBuf::new();
     receipt_dir.push("receipts");
+    receipt_dir.push("fixed");
     receipt_dir.push(period_offset.to_string());
     std::fs::create_dir_all(&receipt_dir).unwrap();
     for (hash, receipt) in receipts {
         let mut path = receipt_dir.clone();
-        path.push(hex::encode(hash));
-        std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
-    }
-
-    // Write retry receipts
-    writeln!(
-        retry_file,
-        "farm_id,previous_stellar_address,new_stellar_address,amount TFT,retry_for",
-    )
-    .unwrap();
-    let mut retry_receipt_dir = path::PathBuf::new();
-    retry_receipt_dir.push("receipts");
-    retry_receipt_dir.push("retries");
-    retry_receipt_dir.push(period_offset.to_string());
-    std::fs::create_dir_all(&retry_receipt_dir).unwrap();
-    for (hash, receipt) in retry_receipts {
-        writeln!(
-            retry_file,
-            "{},{},{},{}.{:07},{}",
-            receipt.farm_id,
-            receipt.previous_stellar_payout_address,
-            receipt.stellar_payout_address,
-            receipt.reward.tft / UNITS_PER_TFT,
-            receipt.reward.tft % UNITS_PER_TFT,
-            receipt.retry_for_receipt,
-        )
-        .unwrap();
-        let mut path = retry_receipt_dir.clone();
         path.push(hash);
         std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
     }
@@ -1006,9 +925,7 @@ impl MintingNode {
     /// Calculate the amount of mUSD generated by the node for carbon offset.
     ///
     /// This is solely based on the CU and SU, therefore it can be calculated from just the node
-    /// definition without aggregating the blocks of a period. Also, this definition comes from a
-    /// random google sheet somewhere as specified in the constants used. If you expected proper
-    /// specifications, boy you came to the wrong place.
+    /// definition without aggregating the blocks of a period.
     ///
     /// A virtualized node is garbage so that does not receive anything.
     fn node_carbon_musd(&self) -> u64 {
@@ -1134,25 +1051,27 @@ impl MintingNode {
     }
 
     /// Get the payout for a node in mUSD and units TFT for a period. This accounts for scaled
-    /// period due to connection time, and SLA
+    /// period due to connection time, and SLA.
+    ///
+    /// Payout is linear now, with accuracy of 0.001%.
     fn scaled_payout(&self, period: Period) -> (u64, u64) {
-        // If we did not manage to achieve SLA, don't bother
-        if !self.sla_achieved(period) {
-            return (0, 0);
+        if let Some((_, _, uptime)) = self.uptime_info {
+            // Calculate uptime with 0.001% precision by upscaling with factor 1_000.
+            // We don't sale the period since the linear payment cancels out eventually.
+            let mut uptime_percentage = uptime * 1_000 / period.duration();
+            // Sanity check
+            if uptime_percentage > 1_000 {
+                uptime_percentage = 1_000;
+            }
+
+            // Scale payouts, remember to divide by the upscale.
+            let musd = self.node_payout_musd() * uptime_percentage / 1_000;
+            let tft = self.node_payout_tft_units() * uptime_percentage / 1_000;
+
+            (musd, tft)
+        } else {
+            (0, 0)
         }
-
-        let full_musd = self.node_payout_musd();
-        let full_tft = self.node_payout_tft_units();
-
-        let actual_period = self.real_period(period);
-        if actual_period != period {
-            return (
-                full_musd * actual_period.duration() / period.duration(),
-                full_tft * actual_period.duration() / period.duration(),
-            );
-        }
-
-        (full_musd, full_tft)
     }
 
     /// Get the carbon payout for a node in mUSD and units TFT for a period. This scales linearly with

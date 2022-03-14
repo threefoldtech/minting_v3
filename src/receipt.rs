@@ -1,6 +1,7 @@
 use crate::period::Period;
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use serde::{Deserialize, Serialize};
+use std::ops::Sub;
 
 type Blake2b256 = Blake2b<U32>;
 
@@ -38,7 +39,7 @@ impl MintingReceipt {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 /// Cloud units for a node.
 pub struct CloudUnits {
     pub cu: f64,
@@ -46,13 +47,43 @@ pub struct CloudUnits {
     pub nu: f64,
 }
 
-#[derive(Serialize, Deserialize)]
+impl Sub for CloudUnits {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            cu: self.cu - rhs.cu,
+            su: self.su - rhs.su,
+            nu: self.nu - rhs.nu,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
 /// Payout for a node.
 pub struct Reward {
     /// Reward in milli USD.
     pub musd: u64,
     /// Reward in TFT units. 1 TFT -> 1e7 units.
     pub tft: u64,
+}
+
+impl Sub for Reward {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self::Output {
+        // If we would end up with a negative, set to 0
+        Self {
+            musd: if self.musd >= rhs.musd {
+                self.musd - rhs.musd
+            } else {
+                0
+            },
+            tft: if self.tft >= rhs.tft {
+                self.tft - rhs.tft
+            } else {
+                0
+            },
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -105,8 +136,9 @@ pub struct FixupReceipt {
     pub period: Period,
     pub node_id: u32,
     pub farm_id: u32,
-    pub previous_calculated_cu: f64,
-    pub actual_cu: f64,
+    pub minted_cloud_units: CloudUnits,
+    pub correct_cloud_units: CloudUnits,
+    pub fixup_cloud_units: CloudUnits,
     pub stellar_payout_address: String,
     pub minted_receipt: String,
     pub correct_receipt: String,
