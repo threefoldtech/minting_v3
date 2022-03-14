@@ -949,7 +949,7 @@ impl MintingNode {
         //
         // MIN is associative.
         let cu_intermediate = std::cmp::min(
-            self.resources.cru as u128 * GIB * ONE_MILL,
+            self.resources.cru as u128 * 2 * GIB * ONE_MILL,
             (self.resources.mru as u128 - 1 * GIB) * ONE_MILL / 4,
         );
         let cu = std::cmp::min(cu_intermediate, self.resources.sru as u128 * ONE_MILL / 50);
