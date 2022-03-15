@@ -1130,25 +1130,27 @@ impl MintingNode {
     }
 
     /// Get the payout for a node in mUSD and units TFT for a period. This accounts for scaled
-    /// period due to connection time, and SLA
+    /// period due to connection time, and SLA.
+    ///
+    /// Payout is linear to node uptime in the period.
     fn scaled_payout(&self, period: Period) -> (u64, u64) {
-        // If we did not manage to achieve SLA, don't bother
-        if !self.sla_achieved(period) {
-            return (0, 0);
+        if let Some((_, _, uptime)) = self.uptime_info {
+            // Calculate uptime with 0.001% precision by upscaling with factor 1_000.
+            // We don't sale the period since the linear payment cancels out eventually.
+            let mut uptime_percentage = uptime * 1_000 / period.duration();
+            // Sanity check
+            if uptime_percentage > 1_000 {
+                uptime_percentage = 1_000;
+            }
+
+            // Scale payouts, remember to divide by the upscale.
+            let musd = self.node_payout_musd() * uptime_percentage / 1_000;
+            let tft = self.node_payout_tft_units() * uptime_percentage / 1_000;
+
+            (musd, tft)
+        } else {
+            (0, 0)
         }
-
-        let full_musd = self.node_payout_musd();
-        let full_tft = self.node_payout_tft_units();
-
-        let actual_period = self.real_period(period);
-        if actual_period != period {
-            return (
-                full_musd * actual_period.duration() / period.duration(),
-                full_tft * actual_period.duration() / period.duration(),
-            );
-        }
-
-        (full_musd, full_tft)
     }
 
     /// Get the carbon payout for a node in mUSD and units TFT for a period. This scales linearly with
