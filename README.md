@@ -9,7 +9,8 @@ the V3 tokenomics.
 | --- | --- | --- |
 | v3.0.0 | 45 | january 2022. Uptime SLA was not enforced |
 | v3.1.0 | 46 | february 2022 |
+| v3.1.1 | 46 | february 2022 correction |
 
 ### Upcomming minting
 
-- Correction for february 2022, will happen with tag 3.1.1 once approved by DAO
+- march 2022
