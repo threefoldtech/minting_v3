@@ -652,10 +652,6 @@ fn main() {
         let (cu, su, nu) = node.cloud_units_permill();
         let (musd, tft) = node.scaled_payout(period);
         let (co_musd, co_tft) = node.scaled_carbon_payout(period);
-        //let musd = node.node_payout_musd();
-        //let co_musd = node.node_carbon_musd();
-        //let tft = node.node_payout_tft_units();
-        //let co_tft = node.node_carbon_tft_units();
         let cru_used = (node.capacity_consumption.cru / node_period_duration as u128) as u64;
         let mru_used = (node.capacity_consumption.mru / node_period_duration as u128) as u64;
         let hru_used = (node.capacity_consumption.hru / node_period_duration as u128) as u64;
