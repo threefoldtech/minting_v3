@@ -21,7 +21,11 @@ impl Horizon {
         }
     }
 
-    pub fn filter_previous_mints<V>(&self, mint_map: &mut HashMap<[u8; 32], V>) {
+    pub fn filter_previous_mints<V, W>(
+        &self,
+        mint_map: &mut HashMap<[u8; 32], V>,
+        other_mint_map: &mut HashMap<[u8; 32], W>,
+    ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()
@@ -48,6 +52,7 @@ impl Horizon {
                         let mut hash = [0; 32];
                         base64::decode_config_slice(memo, base64::STANDARD, &mut hash).unwrap();
                         mint_map.remove(&hash);
+                        other_mint_map.remove(&hash);
                     }
                 }
                 if resp.records.len() < PAGE_LIMIT as usize {

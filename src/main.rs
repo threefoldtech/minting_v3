@@ -1,8 +1,11 @@
-use crate::{period::Period, receipt::RetryPayoutReceipt};
+use crate::period::Period;
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use chrono::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
-use receipt::{CloudUnits, MintingReceipt, ResourceUnits, ResourceUtilization, Reward};
+use receipt::{
+    CloudUnits, FixupReceipt, MintingReceipt, ResourceUnits, ResourceUtilization,
+    RetryPayoutReceipt, Reward,
+};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
@@ -72,7 +75,8 @@ const UPTIME_SLA_PERCENT: u64 = 95;
 /// Value provided by Andreas Hartl in a Telegram DM on 03-02-2022
 const CARBON_CREDIT_ADDRESS: &str = "GDIJY6K2BBRIRX423ZFUYKKFDN66XP2KMSBZFQSE2PSNDZ6EDVQTRLSU";
 /// Address of horizon server to use
-const HORIZON_URL: &str = "https://stellar-mainnet.grid.tf";
+//const HORIZON_URL: &str = "https://stellar-mainnet.grid.tf";
+const HORIZON_URL: &str = "https://horizon.stellar.org";
 
 fn main() {
     // TODO: use `clap` to properly have flags for this
@@ -115,16 +119,49 @@ fn main() {
         }
     }
 
-    if previous_receipts.len() > 0 {
+    // load previous fixup receipts
+    println!(
+        "Loading fixup receipts from period {}",
+        previous_period_offset
+    );
+    let mut previous_fixup_receipt_dir = path::PathBuf::new();
+    previous_fixup_receipt_dir.push("receipts");
+    previous_fixup_receipt_dir.push("fixed");
+    previous_fixup_receipt_dir.push(previous_period_offset.to_string());
+
+    let mut previous_fixup_receipts = HashMap::new();
+
+    match std::fs::read_dir(&previous_fixup_receipt_dir) {
+        Err(_) => {
+            println!("Previous fixup receipt dir does not exist, skip loading fixup receipts")
+        }
+        Ok(dir_iter) => {
+            for file in dir_iter {
+                let file = file.unwrap();
+                if !file.file_type().unwrap().is_file() {
+                    continue;
+                }
+                let mut hash = [0; 32];
+                hex::decode_to_slice(file.file_name().as_bytes(), &mut hash).unwrap();
+                let mut path = previous_fixup_receipt_dir.clone();
+                path.push(file.file_name());
+                let data = fs::read_to_string(path).unwrap();
+                let receipt: FixupReceipt = serde_json::from_str(&data).unwrap();
+                previous_fixup_receipts.insert(hash, receipt);
+            }
+        }
+    }
+
+    if previous_receipts.len() > 0 || previous_fixup_receipts.len() > 0 {
         println!(
             "Filtering receipts, pre filter length {}",
-            previous_receipts.len()
+            previous_receipts.len() + previous_fixup_receipts.len()
         );
         let horizon = stellar::Horizon::new(HORIZON_URL);
-        horizon.filter_previous_mints(&mut previous_receipts);
+        horizon.filter_previous_mints(&mut previous_receipts, &mut previous_fixup_receipts);
         println!(
             "Done filtering receipts, post filter length {}",
-            previous_receipts.len()
+            previous_receipts.len() + previous_fixup_receipts.len()
         );
     }
 
@@ -394,10 +431,13 @@ fn main() {
                             // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
                             //    rubish.
                             if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                                // If we already have an uptime violation we don't care anymore.
-                                if node.first_uptime_violation.is_none() {
-                                    node.first_uptime_violation = Some(block.height);
-                                }
+                                // This is possible if a node lags when sending uptime (extrinsic
+                                // takes a while to be accepted). Manual data validation found no
+                                // issues (i.e. all incidents of this type were a result of the
+                                // above). This should be changed in the future.
+                                total_uptime += uptime_delta as u64;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
                             }
                             // 2. The difference in uptime is within reason of the difference in
@@ -430,9 +470,18 @@ fn main() {
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
                             }
-                            //    2. Uptime is too high, this is garbage
+                            //    2. Uptime is higher than previously recorded uptime but too low.
+                            //    This might be a result off network congestion.
+                            if reported_uptime > last_reported_uptime {
+                                total_uptime += uptime_delta as u64;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                continue;
+                            }
+                            //    3. Uptime is too high, this is garbage
                             if node.first_uptime_violation.is_none() {
-                                node.first_uptime_violation = Some(block.height);
+                                node.first_uptime_violation =
+                                    Some((last_reported_at, block.height));
                             }
                             continue;
                         } else {
@@ -546,6 +595,8 @@ fn main() {
             .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
     );
 
+    // Collect post-period uptime events. Violations don't matter here, those will be handled next
+    // period.
     for block in block_stream {
         for event in block.events {
             if let TfchainEvent::TFGrid(event) = event {
@@ -567,6 +618,7 @@ fn main() {
                         }
                         let report_delta = current_time as i64 - last_reported_at;
                         let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
+                        let delta_in_period = end_ts - last_reported_at;
                         // There are quite some situations here. Notice that due to the
                         // blockchain only producing blocks every 6 seconds, and network delay
                         // + a host of other issues, we will allow a node to report uptime with
@@ -575,10 +627,11 @@ fn main() {
                         // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
                         //    rubish.
                         if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                            // If we already have an uptime violation we don't care anymore.
-                            if node.first_uptime_violation.is_none() {
-                                node.first_uptime_violation = Some(block.height);
-                            }
+                            // This will actually be picked up next period as a violation if we
+                            // care for that.
+                            total_uptime += delta_in_period as u64;
+                            node.uptime_info =
+                                Some((current_time as i64, reported_uptime, total_uptime));
                             continue;
                         }
                         // 2. The difference in uptime is within reason of the difference in
@@ -595,7 +648,6 @@ fn main() {
                                 // couple of seconds it will be corrected by the next pings anyhow.
                                 //
                                 // Make sure we don't add too much based on the period.
-                                let delta_in_period = end_ts - last_reported_at;
                                 total_uptime += delta_in_period as u64;
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
@@ -618,9 +670,17 @@ fn main() {
                                 Some((current_time as i64, reported_uptime, total_uptime));
                             continue;
                         }
-                        //    2. Uptime is too high, this is garbage
+                        //    2. Uptime is higher than previously recorded uptime but too low.
+                        //    This might be a result off network congestion.
+                        if reported_uptime > last_reported_uptime {
+                            total_uptime += uptime_delta as u64;
+                            node.uptime_info =
+                                Some((current_time as i64, reported_uptime, total_uptime));
+                            continue;
+                        }
+                        //    3. Uptime is too high, this is garbage
                         if node.first_uptime_violation.is_none() {
-                            node.first_uptime_violation = Some(block.height);
+                            node.first_uptime_violation = Some((last_reported_at, block.height));
                             continue;
                         }
 
@@ -656,7 +716,15 @@ fn main() {
         let mru_used = (node.capacity_consumption.mru / node_period_duration as u128) as u64;
         let hru_used = (node.capacity_consumption.hru / node_period_duration as u128) as u64;
         let sru_used = (node.capacity_consumption.sru / node_period_duration as u128) as u64;
-        let farm = farms.get(&node.farm_id).unwrap();
+        let farm = if let Some(farm) = farms.get(&node.farm_id) {
+            farm
+        } else {
+            println!(
+                "node {} is in farm {} which does not exist anymore",
+                node.id, node.farm_id
+            );
+            continue;
+        };
         let stellar_address = if let Some(stellar_address) = payout_addresses.get(&node.farm_id) {
             &stellar_address
         } else {
@@ -698,8 +766,8 @@ fn main() {
                 "DIY"
             },
             node.virtualized,
-            if let Some(violation) = node.first_uptime_violation {
-                format!("violation of uptime measurement in block {}", violation)
+            if let Some((lra, violation)) = node.first_uptime_violation {
+                format!("violation of uptime measurement in block {} (previous report {})", violation, lra)
             } else {
                 "".into()
             },
@@ -760,6 +828,41 @@ fn main() {
         retry_receipts.insert(retry_hash, retry_receipt);
     }
 
+    let mut retry_fixed_receipts = HashMap::new();
+    for (hash, failed_receipt) in previous_fixup_receipts {
+        // no point in doing this
+        if failed_receipt.fixup_reward.tft == 0 {
+            continue;
+        }
+        let retry_receipt = RetryPayoutReceipt {
+            failed_payout_period: failed_receipt.period,
+            retry_period: period,
+            farm_id: failed_receipt.farm_id,
+            previous_stellar_payout_address: failed_receipt.stellar_payout_address,
+            stellar_payout_address: payout_addresses
+                .get(&failed_receipt.farm_id)
+                .map(|a| a.clone())
+                .unwrap_or("".to_string()),
+            retry_for_receipt: hex::encode(hash),
+            reward: failed_receipt.fixup_reward,
+        };
+        let retry_hash = hex::encode(retry_receipt.hash());
+
+        if !retry_receipt.stellar_payout_address.is_empty() && retry_receipt.reward.tft != 0 {
+            writeln!(
+                payout_file,
+                "{},{}.{:07},{}",
+                retry_receipt.stellar_payout_address,
+                retry_receipt.reward.tft / UNITS_PER_TFT,
+                retry_receipt.reward.tft % UNITS_PER_TFT,
+                retry_hash,
+            )
+            .unwrap();
+        }
+
+        retry_fixed_receipts.insert(retry_hash, retry_receipt);
+    }
+
     // Sort hashes in lexicographical order
     let mut receipt_hashes = receipts.keys().cloned().collect::<Vec<_>>();
     receipt_hashes.sort_unstable();
@@ -795,12 +898,29 @@ fn main() {
         "farm_id,previous_stellar_address,new_stellar_address,amount TFT,retry_for",
     )
     .unwrap();
+
     let mut retry_receipt_dir = path::PathBuf::new();
     retry_receipt_dir.push("receipts");
     retry_receipt_dir.push("retries");
     retry_receipt_dir.push(period_offset.to_string());
     std::fs::create_dir_all(&retry_receipt_dir).unwrap();
     for (hash, receipt) in retry_receipts {
+        writeln!(
+            retry_file,
+            "{},{},{},{}.{:07},{}",
+            receipt.farm_id,
+            receipt.previous_stellar_payout_address,
+            receipt.stellar_payout_address,
+            receipt.reward.tft / UNITS_PER_TFT,
+            receipt.reward.tft % UNITS_PER_TFT,
+            receipt.retry_for_receipt,
+        )
+        .unwrap();
+        let mut path = retry_receipt_dir.clone();
+        path.push(hash);
+        std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    }
+    for (hash, receipt) in retry_fixed_receipts {
         writeln!(
             retry_file,
             "{},{},{},{}.{:07},{}",
@@ -914,7 +1034,7 @@ struct MintingNode {
     // (last ping, last reported uptime, total uptime).
     uptime_info: Option<(i64, u64, u64)>,
     // Block where the first uptime report violation was detected, if any.
-    first_uptime_violation: Option<u32>,
+    first_uptime_violation: Option<(i64, u32)>,
     connected: NodeConnected,
     // TFT price expressed in USD at time of connection. Price is expressed in mUSD (3 digits
     // precision). I.e. 1 USD => 1000.
