@@ -80,7 +80,7 @@ const HORIZON_URL: &str = "https://horizon.stellar.org";
 
 fn main() {
     // TODO: use `clap` to properly have flags for this
-    let network = Network::Main;
+    let network = Network::Test;
     let mut args = std::env::args();
     // ignore binary name
     args.next();
@@ -548,6 +548,42 @@ fn main() {
 
                         contract.last_reported_nru = report.nru;
                         contract.last_report_ts = report.timestamp as i64;
+                    }
+                    SmartContractEvent::NruConsumption(contract_id, timestamp, window, nru) => {
+                        // TODO: MEASURE CAP USAGE AS WELL
+                        let contract = match contracts.get_mut(&contract_id) {
+                            Some(contract) => contract,
+                            // Contract needs to exist. This might be triggered if an ancient
+                            // contract gets updated, which means it did not even get an update in
+                            // the time between loading the contract and the start of the period.
+                            // This indicates capacity which is not used anyhow, so we ignore that.
+                            None => continue,
+                        };
+                        let node = match nodes.get_mut(&contract.node_id) {
+                            Some(node) => node,
+                            None => {
+                                panic!(
+                                    "can't process consumption for unknown node {} in block {}",
+                                    contract.node_id, block.height
+                                )
+                            }
+                        };
+                        // Just to make sure reports are ordered
+                        if timestamp as i64 <= contract.last_report_ts {
+                            // Silently ignore reports out of order, we already covered this in an
+                            // already processed consumption report. This can happen if the node pushes
+                            // a contract consumption report twice.
+                            continue;
+                        }
+
+                        // If report ts predates start we just memorize it but don't give credit.
+                        if (timestamp as i64) < start_ts {
+                            contract.last_report_ts = timestamp as i64;
+                            continue;
+                        }
+
+                        node.capacity_consumption.nru += nru;
+                        contract.last_report_ts = timestamp as i64;
                     }
                     SmartContractEvent::ContractCreated(contract) => {
                         // we only care about node contracts
