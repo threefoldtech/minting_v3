@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@hookform/error-message": "^2.0.0",
+    "axios": "^0.26.1"
+  }
+}
