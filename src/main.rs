@@ -1000,18 +1000,25 @@ where
             }
             let window = match Window::at_height(client.clone(), height, network) {
                 Ok(maybe_window) => maybe_window.unwrap(),
-                Err(_) => {
+                Err(e) => {
+                    eprintln!("Could not create window at height {}: {}", height, e);
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     continue;
                 }
             };
             let timestamp = match window.date() {
                 Ok(ts) => ts,
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("Could not fetch time at height {}: {}", height, e);
+                    continue;
+                }
             };
             let events = match window.events() {
                 Ok(evt) => evt,
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("Failed to fetch events at height {}: {}", height, e);
+                    continue;
+                }
             };
             tx.send(MintingBlock {
                 height,
