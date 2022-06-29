@@ -233,106 +233,34 @@ fn main() {
         })
         .collect();
 
-    let contract_search_start_block = if BLOCKS_IN_HOUR * 72 + 1 > start_block {
-        1
-    } else {
-        start_block - 72 * BLOCKS_IN_HOUR - 1
-    };
     // Grab existing contracts
-    let mut contracts: BTreeMap<_, _> =
-        Window::at_height(client.clone(), contract_search_start_block, network)
-            .unwrap()
-            .unwrap()
-            .contracts(false)
-            .unwrap()
-            .into_iter()
-            .filter_map(|contract| {
-                let contract = contract.unwrap();
-                // Namecontract is actually billed once deployed through a node contract.
-                if let ContractData::NodeContract(nc) = contract.contract_type {
-                    Some((
-                        contract.contract_id,
-                        Contract {
-                            contract_id: contract.contract_id,
-                            node_id: nc.node_id,
-                            // a report should pop up for this
-                            last_report_ts: 0,
-                            last_reported_nru: 0,
-                            ips: nc.public_ips,
-                        },
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
-    println!("Found {} existing contracts", contracts.len());
-
-    // Fetch the last known consumption reports for the active contracts so we have a baseline to
-    // work from. It is possible that a bit of the network was consumed in the previous period.
-    // This will be corrected by not gathering consumption reports after the period ends. So
-    // essentially this small time window (max 1 hour) is covered in the next payout.
-    println!("Extract consumption reports for existing contracts");
-    let consumption_blocks = block_import(
-        client.clone(),
-        contract_search_start_block,
-        start_block - 1,
-        network,
-    );
-
-    let bar = ProgressBar::new((start_block - contract_search_start_block) as u64 - 1);
-    bar.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {wide_bar} {pos:>3}/{len:>3} (ETA: {eta_precise})"),
-    );
-    for block in consumption_blocks {
-        for event in block.events {
-            if let TfchainEvent::SmartContract(contract_event) = event {
-                match contract_event {
-                    SmartContractEvent::ConsumptionReportReceived(report) => {
-                        let contract = match contracts.get_mut(&report.contract_id) {
-                            Some(contract) => contract,
-                            None => panic!(
-                                "can't report consumption for unknown contract {} in block {}",
-                                report.contract_id, block.height
-                            ),
-                        };
-                        contract.last_report_ts = report.timestamp as i64;
-                        contract.last_reported_nru = report.nru;
-                    }
-                    SmartContractEvent::ContractCreated(contract) => {
-                        // we only care about node contracts
-                        if let ContractData::NodeContract(nc) = contract.contract_type {
-                            contracts.insert(
-                                contract.contract_id,
-                                Contract {
-                                    contract_id: contract.contract_id,
-                                    node_id: nc.node_id,
-                                    last_report_ts: block.timestamp.timestamp(),
-                                    last_reported_nru: 0,
-                                    ips: nc.public_ips,
-                                },
-                            );
-                        };
-                    }
-                    _ => {}
-                };
-            };
-        }
-        bar.inc(1);
-    }
-    bar.finish_and_clear();
-
-    // Remove contracts that did not get updated
-    print!(
-        "Removing contracts without known reports, pre filter length {}",
-        contracts.len()
-    );
-    let mut contracts: BTreeMap<_, _> = contracts
+    let mut contracts: BTreeMap<_, _> = Window::at_height(client.clone(), start_block, network)
+        .unwrap()
+        .unwrap()
+        .contracts(false)
+        .unwrap()
         .into_iter()
-        .filter(|(_, c)| c.last_report_ts != 0)
+        .filter_map(|contract| {
+            let (contract, resources) = contract.unwrap();
+            // Namecontract is actually billed once deployed through a node contract.
+            if let ContractData::NodeContract(nc) = contract.contract_type {
+                Some((
+                    contract.contract_id,
+                    Contract {
+                        contract_id: contract.contract_id,
+                        node_id: nc.node_id,
+                        // a report should pop up for this
+                        last_report_ts: 0,
+                        ips: nc.public_ips,
+                        resources,
+                    },
+                ))
+            } else {
+                None
+            }
+        })
         .collect();
-    println!(" post filter length {}", contracts.len());
+    println!("Found {} existing contracts", contracts.len());
 
     println!("Setup block import pipeline");
     let blocks = end_block - start_block + 1;
@@ -498,66 +426,23 @@ fn main() {
                     _ => {}
                 },
                 TfchainEvent::SmartContract(contract_event) => match contract_event {
-                    SmartContractEvent::ConsumptionReportReceived(report) => {
-                        let contract = match contracts.get_mut(&report.contract_id) {
-                            Some(contract) => contract,
-                            // Contract needs to exist. This might be triggered if an ancient
-                            // contract gets updated, which means it did not even get an update in
-                            // the time between loading the contract and the start of the period.
-                            // This indicates capacity which is not used anyhow, so we ignore that.
-                            None => continue,
-                        };
-                        let node = match nodes.get_mut(&contract.node_id) {
-                            Some(node) => node,
-                            None => {
-                                panic!(
-                                    "can't process consumption for unknown node {} in block {}",
-                                    contract.node_id, block.height
-                                )
-                            }
-                        };
-                        // Just to make sure reports are ordered
-                        if report.timestamp as i64 <= contract.last_report_ts {
-                            // Silently ignore reports out of order, we already covered this in an
-                            // already processed consumption report. This can happen if the node pushes
-                            // a contract consumption report twice.
-                            continue;
-                        }
-
-                        // If report ts predates start we just memorize it but don't give credit.
-                        if (report.timestamp as i64) < start_ts {
-                            contract.last_reported_nru = report.nru;
-                            contract.last_report_ts = report.timestamp as i64;
-                            continue;
-                        }
-
-                        let time_elapsed = report.timestamp - contract.last_report_ts as u64;
-                        node.capacity_consumption.cru += (report.cru * time_elapsed) as u128;
-                        node.capacity_consumption.mru += (report.mru * time_elapsed) as u128;
-                        node.capacity_consumption.hru += (report.hru * time_elapsed) as u128;
-                        node.capacity_consumption.sru += (report.sru * time_elapsed) as u128;
-                        node.capacity_consumption.ips += contract.ips as u64 * time_elapsed;
-                        // Need to detect if the counter for nru was reset
-                        let nru_used = if contract.last_reported_nru > report.nru {
-                            // Counter reset
-                            report.nru
-                        } else {
-                            report.nru - contract.last_reported_nru
-                        };
-                        node.capacity_consumption.nru += nru_used;
-
-                        contract.last_reported_nru = report.nru;
-                        contract.last_report_ts = report.timestamp as i64;
-                    }
-                    SmartContractEvent::NruConsumption(contract_id, timestamp, window, nru) => {
-                        // TODO: MEASURE CAP USAGE AS WELL
+                    SmartContractEvent::UpdatedUsedResources(contract_id, resources) => {
                         let contract = match contracts.get_mut(&contract_id) {
                             Some(contract) => contract,
-                            // Contract needs to exist. This might be triggered if an ancient
-                            // contract gets updated, which means it did not even get an update in
-                            // the time between loading the contract and the start of the period.
-                            // This indicates capacity which is not used anyhow, so we ignore that.
-                            None => continue,
+                            // Contract needs to exist.
+                            None => {
+                                panic!("Can't set used resources for contract {} which does not exist in block {}", contract_id, block.height);
+                            }
+                        };
+                        contract.resources = resources;
+                    }
+                    SmartContractEvent::NruConsumption(contract_id, timestamp, window, nru) => {
+                        let contract = match contracts.get_mut(&contract_id) {
+                            Some(contract) => contract,
+                            // Contract needs to exist.
+                            None => {
+                                panic!("Can't set used resources for contract {} which does not exist in block {}", contract_id, block.height);
+                            }
                         };
                         let node = match nodes.get_mut(&contract.node_id) {
                             Some(node) => node,
@@ -576,12 +461,15 @@ fn main() {
                             continue;
                         }
 
-                        // If report ts predates start we just memorize it but don't give credit.
+                        // If report ts predates start we ignore it.
                         if (timestamp as i64) < start_ts {
-                            contract.last_report_ts = timestamp as i64;
                             continue;
                         }
-
+                        node.capacity_consumption.cru += (contract.resources.cru * window) as u128;
+                        node.capacity_consumption.mru += (contract.resources.mru * window) as u128;
+                        node.capacity_consumption.hru += (contract.resources.hru * window) as u128;
+                        node.capacity_consumption.sru += (contract.resources.sru * window) as u128;
+                        node.capacity_consumption.ips += contract.ips as u64 * window;
                         node.capacity_consumption.nru += nru;
                         contract.last_report_ts = timestamp as i64;
                     }
@@ -594,8 +482,8 @@ fn main() {
                                     contract_id: contract.contract_id,
                                     node_id: nc.node_id,
                                     last_report_ts: block.timestamp.timestamp(),
-                                    last_reported_nru: 0,
                                     ips: nc.public_ips,
+                                    resources: Resources::default(),
                                 },
                             );
                         };
@@ -1333,8 +1221,9 @@ struct Contract {
     node_id: u32,
     // timestamp of last report. If not set, time when the contract was created.
     last_report_ts: i64,
-    last_reported_nru: u64,
     ips: u32,
+    // Resources set on chain
+    resources: Resources,
 }
 
 #[derive(Default)]
