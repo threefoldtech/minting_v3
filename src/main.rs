@@ -17,7 +17,7 @@ use std::{
 use tfchain_client::{
     client::{Client, MultiSignature, Pair, SharedClient},
     events::{SmartContractEvent, TFGridEvent, TfchainEvent},
-    types::{BlockNumber, CertificationType, ContractData, Farm, Location, Resources},
+    types::{BlockNumber, ContractData, Farm, Location, NodeCertification, Resources},
     window::{Network, Window},
 };
 
@@ -80,7 +80,7 @@ const HORIZON_URL: &str = "https://horizon.stellar.org";
 
 fn main() {
     // TODO: use `clap` to properly have flags for this
-    let network = Network::Test;
+    let network = Network::Main;
     let mut args = std::env::args();
     // ignore binary name
     args.next();
@@ -195,7 +195,7 @@ fn main() {
                     country: node.country,
                     city: node.city,
                     created: node.created,
-                    certification_type: node.certification_type,
+                    certification_type: node.certification,
                     uptime_info: None,
                     first_uptime_violation: None,
                     connected: NodeConnected::Old,
@@ -290,7 +290,7 @@ fn main() {
                                 country: node.country,
                                 city: node.city,
                                 created: node.created,
-                                certification_type: node.certification_type,
+                                certification_type: node.certification,
                                 uptime_info: None,
                                 first_uptime_violation: None,
                                 connected: NodeConnected::Current(block.timestamp.timestamp()),
@@ -325,7 +325,7 @@ fn main() {
                         // Update certification type. It's technically possible for a node to jump
                         // from DIY to certified and back in the same period, but practically that
                         // should not happen.
-                        old_node.certification_type = node.certification_type;
+                        old_node.certification_type = node.certification;
                         // Even though this likely means the node is rebooted, don't mess with
                         // uptime_info. The reboot will be detected in the `NodeUptimeReported`
                         // handler.
@@ -684,7 +684,7 @@ fn main() {
             node.resources.sru,
             if node.resources.sru > 0 {sru_used as f64 * 100. / node.resources.sru as f64} else {0.},
             node.capacity_consumption.ips as f64 / 3600.,
-            if let CertificationType::Certified = node.certification_type {
+            if let NodeCertification::Certified = node.certification_type {
                 "CERTIFIED"
             } else {
                 "DIY"
@@ -961,7 +961,7 @@ struct MintingNode {
     country: String,
     city: String,
     created: u64,
-    certification_type: CertificationType,
+    certification_type: NodeCertification,
     // (last ping, last reported uptime, total uptime).
     uptime_info: Option<(i64, u64, u64)>,
     // Block where the first uptime report violation was detected, if any.
@@ -1033,7 +1033,7 @@ impl MintingNode {
         // hourly reward, then divide by 3600 seconds/hour. This prevents issues with low usage.
         let ip_reward = self.capacity_consumption.ips * IP_REWARD_MUSD / 3600;
         let base_payout = (cu_reward + su_reward + nu_reward) / ONE_MILL as u64 + ip_reward;
-        if matches!(self.certification_type, CertificationType::Certified) {
+        if matches!(self.certification_type, NodeCertification::Certified) {
             base_payout * 5 / 4
         } else {
             base_payout
@@ -1152,8 +1152,8 @@ impl MintingNode {
                 tft: carbon_tft,
             },
             node_type: match self.certification_type {
-                CertificationType::Diy => "DIY".into(),
-                CertificationType::Certified => "CERTIFIED".into(),
+                NodeCertification::Diy => "DIY".into(),
+                NodeCertification::Certified => "CERTIFIED".into(),
             },
         }
     }
