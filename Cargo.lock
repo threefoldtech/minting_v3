@@ -3093,7 +3093,7 @@ dependencies = [
 [[package]]
 name = "pallet-tft-bridge"
 version = "1.0.0"
-source = "git+https://github.com/threefoldtech/tfchain_tft_bridge?branch=main#7fafcd2f02f214b8342b560967a4114f095ac239"
+source = "git+https://github.com/threefoldtech/tfchain_tft_bridge?branch=main#e186513026a92fa2ba7bcac1b903140e9ab202bc"
 dependencies = [
  "frame-support",
  "frame-system",
@@ -4861,7 +4861,7 @@ checksum = "35391ea974fa5ee869cb094d5b437688fbf3d8127d64d1b9fed5822a1ed39b12"
 [[package]]
 name = "sp-std"
 version = "4.0.0"
-source = "git+https://github.com/paritytech/substrate#8310936bd25519cee81abb01d2b164805f01bc25"
+source = "git+https://github.com/paritytech/substrate#b27c470eaff379f512d1dec052aff5d551ed3b03"
 
 [[package]]
 name = "sp-storage"
@@ -5451,7 +5451,7 @@ dependencies = [
 [[package]]
 name = "tfchain_client"
 version = "0.1.0"
-source = "git+https://github.com/threefoldtech/tfchain_client?branch=main#023669036ab1007f3a40113988c3931a5e389258"
+source = "git+https://github.com/threefoldtech/tfchain_client?branch=main#5001b7df6c98b7d66dcaa29f99de3f68de0d212a"
 dependencies = [
  "chrono",
  "clap",
