@@ -33,3 +33,6 @@ sp-core = "3.0.0"
 sp-runtime = "3.0.0"
 system = { package = "frame-system", version = "3.0.0" }
 support = { package = "frame-support", version = "3.0.0" }
+
+[patch.'https://github.com/threefoldtech/tfchain_tft_bridge']
+pallet-tft-bridge = {path = "./tfchain_tft_bridge/pallet-tft-bridge" }
