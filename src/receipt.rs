@@ -27,6 +27,36 @@ pub struct MintingReceipt {
     pub carbon_offset: Reward,
     /// Certification type of the node, "Certified" or "DIY".
     pub node_type: String,
+    #[serde(default = "default_farming_policy_id")]
+    pub farming_policy_id: u32,
+    #[serde(default)]
+    pub resource_rewards: ResourceRewards,
+}
+
+/// Helper function so old minting receipts which did not have a farming policy id can be
+/// deserialized.
+const fn default_farming_policy_id() -> u32 {
+    1
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ResourceRewards {
+    pub cu: u64,
+    pub su: u64,
+    pub nu: u64,
+    pub ipv4: u64,
+}
+
+/// These are the values of the initial farming policy.
+impl Default for ResourceRewards {
+    fn default() -> Self {
+        ResourceRewards {
+            cu: 2400,
+            su: 1000,
+            nu: 30,
+            ipv4: 5,
+        }
+    }
 }
 
 impl MintingReceipt {

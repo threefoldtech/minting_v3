@@ -3,7 +3,7 @@ use blake2::{digest::consts::U32, Blake2b, Digest};
 use chrono::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use receipt::{
-    CloudUnits, FixupReceipt, MintingReceipt, ResourceUnits, ResourceUtilization,
+    CloudUnits, FixupReceipt, MintingReceipt, ResourceRewards, ResourceUnits, ResourceUtilization,
     RetryPayoutReceipt, Reward,
 };
 use std::{
@@ -17,7 +17,9 @@ use std::{
 use tfchain_client::{
     client::{Client, MultiSignature, Pair, SharedClient},
     events::{SmartContractEvent, TFGridEvent, TfchainEvent},
-    types::{BlockNumber, ContractData, Farm, Location, NodeCertification, Resources},
+    types::{
+        BlockNumber, ContractData, Farm, FarmingPolicy, Location, NodeCertification, Resources,
+    },
     window::{Network, Window},
 };
 
@@ -30,31 +32,6 @@ const PRE_FETCH: usize = 5;
 const UPTIME_GRACE_PERIOD_SECONDS: i64 = 300; // 5 Minutes
 const GIB: u128 = 1024 * 1024 * 1024;
 const ONE_MILL: u128 = 1_000_000;
-/// Reward for 1 CU per period in mUSD.
-/// Value taken from [the
-/// wiki](https://library.threefold.me/info/threefold#/tfgrid/farming/threefold__farming_reward?id=farming-reward-calculation)
-/// on 31-01-2022.
-const CU_REWARD_MUSD: u64 = 2400;
-/// Reward for 1 SU per period in mUSD.
-/// Value taken from [the
-/// wiki](https://library.threefold.me/info/threefold#/tfgrid/farming/threefold__farming_reward?id=farming-reward-calculation)
-/// on 31-01-2022.
-const SU_REWARD_MUSD: u64 = 1000;
-/// Reward for 1 NU per period in mUSD.
-/// Value taken from [the
-/// wiki](https://library.threefold.me/info/threefold#/tfgrid/farming/threefold__farming_reward?id=farming-reward-calculation)
-/// on 31-01-2022.
-const NU_REWARD_MUSD: u64 = 30;
-/// Reward for 1 IP reserved for 1 hour in mUSD.
-/// Value taken from [the
-/// wiki](https://library.threefold.me/info/threefold#/tfgrid/farming/threefold__farming_reward?id=farming-reward-calculation)
-/// on 31-01-2022.
-const IP_REWARD_MUSD: u64 = 5;
-/// Price of TFT in mUSD.
-/// Value taken from [the
-/// wiki](https://library.threefold.me/info/threefold#/tfgrid/farming/threefold__farming_reward?id=farming-reward-calculation)
-/// on 31-01-2022.
-const DAO_CONNECTION_PRICE_MUSD: u64 = 80; // 0.08USD
 /// The amount of "units" that make 1 TFT.
 const UNITS_PER_TFT: u64 = 10_000_000;
 /// The amount of blocks expected in an hour.
@@ -199,9 +176,10 @@ fn main() {
                     uptime_info: None,
                     first_uptime_violation: None,
                     connected: NodeConnected::Old,
-                    connection_price: DAO_CONNECTION_PRICE_MUSD,
+                    connection_price: node.connection_price,
                     capacity_consumption: TotalConsumption::default(),
                     virtualized: node.virtualized,
+                    farming_policy_id: node.farming_policy_id,
                 },
             )
         })
@@ -262,6 +240,20 @@ fn main() {
         .collect();
     println!("Found {} existing contracts", contracts.len());
 
+    // Get farming policies
+    let farming_policies: BTreeMap<_, _> = Window::at_height(client.clone(), end_block, network)
+        .unwrap()
+        .unwrap()
+        .farm_policies()
+        .unwrap()
+        .into_iter()
+        .filter_map(|policy| {
+            let policy = policy.unwrap();
+            Some((policy.id, policy))
+        })
+        .collect();
+    println!("Found {} farming policies", farming_policies.len());
+
     println!("Setup block import pipeline");
     let blocks = end_block - start_block + 1;
     let block_stream = block_import(client.clone(), start_block, end_block, network);
@@ -294,9 +286,10 @@ fn main() {
                                 uptime_info: None,
                                 first_uptime_violation: None,
                                 connected: NodeConnected::Current(block.timestamp.timestamp()),
-                                connection_price: DAO_CONNECTION_PRICE_MUSD,
+                                connection_price: node.connection_price,
                                 capacity_consumption: TotalConsumption::default(),
                                 virtualized: node.virtualized,
+                                farming_policy_id: node.farming_policy_id,
                             },
                         );
                     }
@@ -326,6 +319,13 @@ fn main() {
                         // from DIY to certified and back in the same period, but practically that
                         // should not happen.
                         old_node.certification_type = node.certification;
+                        // It is possible that this also causes a node to get a different farming
+                        // policy ID.
+                        old_node.farming_policy_id = node.farming_policy_id;
+                        // Update connection price. This should not happen, but it is here in case
+                        // we modify the connection price of the node in place in the future and
+                        // emit this generic event when the 5 year fixed time is expired.
+                        old_node.connection_price = node.connection_price;
                         // Even though this likely means the node is rebooted, don't mess with
                         // uptime_info. The reboot will be detected in the `NodeUptimeReported`
                         // handler.
@@ -634,7 +634,7 @@ fn main() {
         let node_start = Utc.timestamp(node_period.start(), 0);
         let node_end = Utc.timestamp(node_period.end(), 0);
         let (cu, su, nu) = node.cloud_units_permill();
-        let (musd, tft) = node.scaled_payout(period);
+        let (musd, tft) = node.scaled_payout(period, &farming_policies);
         let (co_musd, co_tft) = node.scaled_carbon_payout(period);
         let cru_used = (node.capacity_consumption.cru / node_period_duration as u128) as u64;
         let mru_used = (node.capacity_consumption.mru / node_period_duration as u128) as u64;
@@ -655,7 +655,7 @@ fn main() {
             ""
         };
         writeln!(overview_file,
-            "{},{},{} ({}),{},{},{},{},{},{},{} $,{} TFT,{} $,{} $,{} TFT,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{},{},{}",
+            "{},{},{} ({}),{},{},{},{},{},{},{} $,{},{} $,{} $,{} TFT,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{},{},{}",
             node.id,
             node.twin_id,
             farm.name,
@@ -698,7 +698,7 @@ fn main() {
             stellar_address,
         ).unwrap();
 
-        let receipt = node.receipt(period, &farms, &payout_addresses);
+        let receipt = node.receipt(period, &farms, &payout_addresses, &farming_policies);
         if !stellar_address.is_empty() && tft != 0 {
             writeln!(
                 payout_file,
@@ -969,10 +969,11 @@ struct MintingNode {
     connected: NodeConnected,
     // TFT price expressed in USD at time of connection. Price is expressed in mUSD (3 digits
     // precision). I.e. 1 USD => 1000.
-    connection_price: u64,
+    connection_price: u32,
     // capacity consumed by workloads over a period.
     capacity_consumption: TotalConsumption,
     virtualized: bool,
+    farming_policy_id: u32,
 }
 
 impl MintingNode {
@@ -1021,19 +1022,26 @@ impl MintingNode {
     /// Additionally, "certified" nodes get 25% extra.
     ///
     /// A virtualized node (i.e. zos running in VM) won't get anything.
-    fn node_payout_musd(&self) -> u64 {
+    fn node_payout_musd(
+        &self,
+        farming_policies: &BTreeMap<u32, FarmingPolicy<BlockNumber>>,
+    ) -> u64 {
         if self.virtualized || self.first_uptime_violation.is_some() {
             return 0;
         }
+        let policy = farming_policies.get(&self.farming_policy_id).unwrap();
         let (cu, su, nu) = self.cloud_units_permill();
-        let cu_reward = cu * CU_REWARD_MUSD;
-        let su_reward = su * SU_REWARD_MUSD;
-        let nu_reward = nu * NU_REWARD_MUSD;
+        let cu_reward = cu * policy.cu as u64;
+        let su_reward = su * policy.su as u64;
+        let nu_reward = nu * policy.nu as u64;
         // Recall that IP usage is actually in seconds. Multiply the seconds of IP usage with the
         // hourly reward, then divide by 3600 seconds/hour. This prevents issues with low usage.
-        let ip_reward = self.capacity_consumption.ips * IP_REWARD_MUSD / 3600;
+        let ip_reward = self.capacity_consumption.ips * policy.ipv4 as u64 / 3600;
         let base_payout = (cu_reward + su_reward + nu_reward) / ONE_MILL as u64 + ip_reward;
-        if matches!(self.certification_type, NodeCertification::Certified) {
+        // TODO: remove once Titans have policy id 2
+        if matches!(self.certification_type, NodeCertification::Certified)
+            && self.farming_policy_id == 1
+        {
             base_payout * 5 / 4
         } else {
             base_payout
@@ -1043,9 +1051,14 @@ impl MintingNode {
     /// Calculate the TFT payout of the node in the minting period based on its cloud units and
     /// connection price. The payout is expressed in "units", where 1 TFT == 10_000_000 units.
     /// This also acconts for measured NU and Ip usage.
-    fn node_payout_tft_units(&self) -> u64 {
+    fn node_payout_tft_units(
+        &self,
+        farming_policies: &BTreeMap<u32, FarmingPolicy<BlockNumber>>,
+    ) -> u64 {
         // connection price is in mUSD.
-        self.node_payout_musd() * UNITS_PER_TFT / self.connection_price
+        // TODO: revert once fixed on chain (presumably period 54)
+        // self.node_payout_musd(farming_policies) * UNITS_PER_TFT / self.connection_price as u64
+        self.node_payout_musd(farming_policies) * UNITS_PER_TFT / 80
     }
 
     /// Calculate the amount of mUSD generated by the node for carbon offset.
@@ -1067,7 +1080,7 @@ impl MintingNode {
 
     /// Calculate the TFT payout generated by the node towards carbon offset.
     fn node_carbon_tft_units(&self) -> u64 {
-        self.node_carbon_musd() * UNITS_PER_TFT / self.connection_price
+        self.node_carbon_musd() * UNITS_PER_TFT / self.connection_price as u64
     }
 
     /// Get the real period for the node given an observed period.
@@ -1086,6 +1099,7 @@ impl MintingNode {
         period: Period,
         farms: &BTreeMap<u32, Farm>,
         payout_addresses: &BTreeMap<u32, String>,
+        farming_policies: &BTreeMap<u32, FarmingPolicy<BlockNumber>>,
     ) -> MintingReceipt {
         let uptime = if let Some((_, _, uptime)) = self.uptime_info {
             uptime
@@ -1101,12 +1115,13 @@ impl MintingNode {
         let mru_used = (self.capacity_consumption.mru / period.duration() as u128) as u64;
         let hru_used = (self.capacity_consumption.hru / period.duration() as u128) as u64;
         let sru_used = (self.capacity_consumption.sru / period.duration() as u128) as u64;
-        let (musd, tft) = self.scaled_payout(period);
+        let (musd, tft) = self.scaled_payout(period, farming_policies);
         let (carbon_musd, carbon_tft) = self.scaled_carbon_payout(period);
         let payout_address = match payout_addresses.get(&self.farm_id) {
             Some(address) => address,
             None => "",
         };
+        let policy = farming_policies.get(&self.farming_policy_id).unwrap();
         MintingReceipt {
             period: self.real_period(period),
             node_id: self.id,
@@ -1115,7 +1130,9 @@ impl MintingNode {
             farm_name: farm.name.clone(),
             stellar_payout_address: payout_address.to_string(),
             measured_uptime: uptime,
-            tft_connection_price: self.connection_price,
+            // TODO: revert once fixed on chain (period 54 presumably)
+            // tft_connection_price: self.connection_price as u64,
+            tft_connection_price: 80,
             cloud_units: CloudUnits { cu, su, nu },
             resource_units: ResourceUnits {
                 cru: self.resources.cru as f64,
@@ -1155,6 +1172,13 @@ impl MintingNode {
                 NodeCertification::Diy => "DIY".into(),
                 NodeCertification::Certified => "CERTIFIED".into(),
             },
+            farming_policy_id: self.farming_policy_id,
+            resource_rewards: ResourceRewards {
+                cu: policy.cu as u64,
+                su: policy.su as u64,
+                nu: policy.nu as u64,
+                ipv4: policy.ipv4 as u64,
+            },
         }
     }
 
@@ -1180,21 +1204,38 @@ impl MintingNode {
     /// period due to connection time, and SLA.
     ///
     /// Payout is linear to node uptime in the period.
-    fn scaled_payout(&self, period: Period) -> (u64, u64) {
+    fn scaled_payout(
+        &self,
+        period: Period,
+        farming_policies: &BTreeMap<u32, FarmingPolicy<BlockNumber>>,
+    ) -> (u64, u64) {
         if let Some((_, _, uptime)) = self.uptime_info {
             // Calculate uptime with 0.001% precision by upscaling with factor 1_000.
-            // We don't sale the period since the linear payment cancels out eventually.
+            // We don't scale the period since the linear payment cancels out eventually.
             let mut uptime_percentage = uptime * 1_000 / period.duration();
             // Sanity check
             if uptime_percentage > 1_000 {
                 uptime_percentage = 1_000;
             }
 
-            // Scale payouts, remember to divide by the upscale.
-            let musd = self.node_payout_musd() * uptime_percentage / 1_000;
-            let tft = self.node_payout_tft_units() * uptime_percentage / 1_000;
-
-            (musd, tft)
+            // Scale payouts for now, remember to divide by the upscale.
+            if self.farming_policy_id == 1 {
+                (
+                    self.node_payout_musd(farming_policies) * uptime_percentage / 1_000,
+                    self.node_payout_tft_units(farming_policies) * uptime_percentage / 1_000,
+                )
+            } else {
+                // Not the default policy, enforce the minimal uptime
+                let policy = farming_policies.get(&self.farming_policy_id).unwrap();
+                if uptime_percentage < policy.minimal_uptime as u64 {
+                    (0, 0)
+                } else {
+                    (
+                        self.node_payout_musd(farming_policies),
+                        self.node_payout_tft_units(farming_policies),
+                    )
+                }
+            }
         } else {
             (0, 0)
         }
