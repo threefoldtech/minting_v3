@@ -52,7 +52,7 @@ function App() {
 					<tr><th></th><th>Node info</th></tr>
 					<tr><th>Node ID</th><td>{receipt.Minting.node_id} ({receipt.Minting.node_type})</td></tr>
 					<tr><th>Farm Name</th><td>{receipt.Minting.farm_name} ({receipt.Minting.farm_id})</td></tr>
-					<tr><th>Measured Uptime</th><td>{(receipt.Minting.measured_uptime / (3600 * 24)).toFixed(2) } days ({(100 * receipt.Minting.measured_uptime / 2630880).toFixed(2)}%)</td></tr>
+					<tr><th>Measured Uptime</th><td>{(receipt.Minting.measured_uptime / (3600 * 24)).toFixed(2) } days ({(100 * receipt.Minting.measured_uptime / (receipt.Minting.period.end - receipt.Minting.period.start)).toFixed(2)}%)</td></tr>
 					<tr><th></th><th>Node Resources</th></tr>
 					<tr><th>CU</th><td>{receipt.Minting.cloud_units.cu.toFixed(2)}</td></tr>
 					<tr><th>SU</th><td>{receipt.Minting.cloud_units.su.toFixed(2)}</td></tr>
