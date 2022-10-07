@@ -415,6 +415,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "904dfeac50f3cdaba28fc6f57fdcddb75f49ed61346676a78c4ffe55877802fd"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2344,6 +2353,7 @@ name = "minting_v3"
 version = "0.1.0"
 dependencies = [
  "base64 0.13.0",
+ "bincode",
  "blake2",
  "chrono",
  "futures 0.3.19",
@@ -2352,6 +2362,7 @@ dependencies = [
  "openssl",
  "serde",
  "serde_json",
+ "sp-application-crypto",
  "sp-core",
  "stellar-base",
  "stellar-horizon",
@@ -4861,7 +4872,7 @@ checksum = "35391ea974fa5ee869cb094d5b437688fbf3d8127d64d1b9fed5822a1ed39b12"
 [[package]]
 name = "sp-std"
 version = "4.0.0"
-source = "git+https://github.com/paritytech/substrate#58d3bc67b9595d0a26f5abba88fe4941a6e75b4a"
+source = "git+https://github.com/paritytech/substrate#a84def97102166643bc3c807ae69892551c47536"
 
 [[package]]
 name = "sp-storage"
@@ -5137,7 +5148,7 @@ dependencies = [
 [[package]]
 name = "substrate-api-client"
 version = "0.5.0"
-source = "git+https://github.com/scs/substrate-api-client?rev=a08d8ae8017535051975f5a7ff20bd93d35e4eb3#a08d8ae8017535051975f5a7ff20bd93d35e4eb3"
+source = "git+https://github.com/LeeSmet/substrate-api-client?branch=static_metadata#1a0b44414145722c59f9e7437939dd6309e0b3bc"
 dependencies = [
  "env_logger",
  "frame-metadata",
@@ -5451,7 +5462,7 @@ dependencies = [
 [[package]]
 name = "tfchain_client"
 version = "0.1.0"
-source = "git+https://github.com/threefoldtech/tfchain_client?branch=main#09e382077f9d81a10061cddc4839cebff99c555c"
+source = "git+https://github.com/threefoldtech/tfchain_client?branch=fixed_meta#29b5b1d3e70489e1ba63d1f0a0def42af89de19a"
 dependencies = [
  "chrono",
  "clap",
@@ -5480,6 +5491,7 @@ dependencies = [
  "pallet-tft-price 1.0.0 (git+https://github.com/threefoldtech/tfchain?rev=1f41591)",
  "pallet-tft-price 1.0.0 (git+https://github.com/threefoldtech/tfchain?rev=57ad7462)",
  "parity-scale-codec 2.3.1",
+ "serde",
  "serde_json",
  "sp-application-crypto",
  "sp-core",

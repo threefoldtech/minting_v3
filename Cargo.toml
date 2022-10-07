@@ -8,10 +8,12 @@ edition = "2021"
 vendored = ["openssl"]
 
 [dependencies]
-tfchain_client = { git = "https://github.com/threefoldtech/tfchain_client", branch = "main" }
+#tfchain_client = { git = "https://github.com/threefoldtech/tfchain_client", branch = "main" }
+tfchain_client = { git = "https://github.com/threefoldtech/tfchain_client", branch = "fixed_meta" }
 #tfchain_client = { path = "../tfchain_client" }
 indicatif = "0.16"
 sp-core = "3.0.0"
+sp-application-crypto = "3.0.0"
 chrono = "0.4"
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -23,6 +25,7 @@ futures = "0.3"
 stellar-horizon = "0.6"
 stellar-base = "0.5"
 base64 = "0.13"
+bincode = "1.3.3"
 
 [patch.'https://github.com/paritytech/substrate']
 metadata = { package = "frame-metadata", version = "13.0.0" }
@@ -33,4 +36,3 @@ sp-core = "3.0.0"
 sp-runtime = "3.0.0"
 system = { package = "frame-system", version = "3.0.0" }
 support = { package = "frame-support", version = "3.0.0" }
-

@@ -6,10 +6,12 @@ use receipt::{
     CloudUnits, FixupReceipt, MintingReceipt, ResourceRewards, ResourceUnits, ResourceUtilization,
     RetryPayoutReceipt, Reward,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
     io::Write,
+    mem,
     os::unix::prelude::OsStrExt,
     path,
     sync::mpsc,
@@ -17,15 +19,16 @@ use std::{
 use tfchain_client::{
     client::{Client, MultiSignature, Pair, SharedClient},
     events::{SmartContractEvent, TFGridEvent, TfchainEvent},
-    types::{
-        BlockNumber, ContractData, Farm, FarmingPolicy, Location, NodeCertification, Resources,
-    },
     window::{Network, Window},
+};
+use types::{
+    BlockNumber, ContractData, Farm, FarmingPolicy, Location, NodeCertification, Resources,
 };
 
 mod period;
 mod receipt;
 mod stellar;
+mod types;
 
 const RPC_THREADS: usize = 100;
 const PRE_FETCH: usize = 5;
@@ -57,7 +60,7 @@ const HORIZON_URL: &str = "https://horizon.stellar.org";
 
 fn main() {
     // TODO: use `clap` to properly have flags for this
-    let network = Network::Main;
+    let network = Network::Test;
     let mut args = std::env::args();
     // ignore binary name
     args.next();
@@ -67,6 +70,8 @@ fn main() {
     let start_ts: i64 = period.start();
     let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
+    // Dump state maybe?
+    let stop_block = args.next();
 
     // load previous receipts
     let previous_period_offset = period_offset - 1;
@@ -167,12 +172,12 @@ fn main() {
                     id: node.id,
                     farm_id: node.farm_id,
                     twin_id: node.twin_id,
-                    resources: node.resources,
-                    location: node.location,
+                    resources: unsafe { mem::transmute(node.resources) },
+                    location: unsafe { mem::transmute(node.location) },
                     country: node.country,
                     city: node.city,
                     created: node.created,
-                    certification_type: node.certification,
+                    certification_type: unsafe { mem::transmute(node.certification) },
                     uptime_info: None,
                     first_uptime_violation: None,
                     connected: NodeConnected::Old,
@@ -221,7 +226,9 @@ fn main() {
         .filter_map(|contract| {
             let (contract, resources) = contract.unwrap();
             // Namecontract is actually billed once deployed through a node contract.
-            if let ContractData::NodeContract(nc) = contract.contract_type {
+            if let ContractData::NodeContract(nc) =
+                unsafe { mem::transmute(contract.contract_type) }
+            {
                 Some((
                     contract.contract_id,
                     Contract {
@@ -230,7 +237,7 @@ fn main() {
                         // a report should pop up for this
                         last_report_ts: 0,
                         ips: nc.public_ips,
-                        resources,
+                        resources: unsafe { mem::transmute(resources) },
                     },
                 ))
             } else {
@@ -254,612 +261,641 @@ fn main() {
         .collect();
     println!("Found {} farming policies", farming_policies.len());
 
-    println!("Setup block import pipeline");
-    let blocks = end_block - start_block + 1;
-    let block_stream = block_import(client.clone(), start_block, end_block, network);
+    let encoded_nodes = bincode::serialize(&nodes).unwrap();
+    let encoded_farms = bincode::serialize(&farms).unwrap();
+    let encoded_contracts = bincode::serialize(&contracts).unwrap();
+    let encoded_payout_addresses = bincode::serialize(&payout_addresses).unwrap();
+    let encoded_farming_policies = bincode::serialize(&farming_policies).unwrap();
 
-    let bar = ProgressBar::new(blocks as u64);
-    bar.set_style(
-        ProgressStyle::default_bar()
-            .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
-    );
-    let mut last_height = start_block - 1;
-    for block in block_stream {
-        assert_eq!(block.height, last_height + 1);
-
-        for event in block.events {
-            match event {
-                TfchainEvent::TFGrid(grid_event) => match *grid_event {
-                    TFGridEvent::NodeStored(node) => {
-                        nodes.insert(
-                            node.id,
-                            MintingNode {
-                                id: node.id,
-                                farm_id: node.farm_id,
-                                twin_id: node.twin_id,
-                                resources: node.resources,
-                                location: node.location,
-                                country: node.country,
-                                city: node.city,
-                                created: node.created,
-                                certification_type: node.certification,
-                                uptime_info: None,
-                                first_uptime_violation: None,
-                                connected: NodeConnected::Current(block.timestamp.timestamp()),
-                                connection_price: node.connection_price,
-                                capacity_consumption: TotalConsumption::default(),
-                                virtualized: node.virtualized,
-                                farming_policy_id: node.farming_policy_id,
-                            },
-                        );
-                    }
-                    TFGridEvent::NodeUpdated(node) => {
-                        let old_node = nodes
-                            .get_mut(&node.id)
-                            .expect("node update of unknown node");
-                        old_node.farm_id = node.farm_id;
-                        old_node.twin_id = node.twin_id;
-                        // update resources, but only lower them in case of dead or removed
-                        // hardware. Do not update in case of added hardware as this is currently
-                        // unresolved.
-                        old_node.resources.cru =
-                            std::cmp::min(old_node.resources.cru, node.resources.cru);
-                        old_node.resources.mru =
-                            std::cmp::min(old_node.resources.mru, node.resources.mru);
-                        old_node.resources.hru =
-                            std::cmp::min(old_node.resources.hru, node.resources.hru);
-                        old_node.resources.sru =
-                            std::cmp::min(old_node.resources.sru, node.resources.sru);
-                        old_node.location = node.location;
-                        old_node.resources = node.resources;
-                        old_node.country = node.country;
-                        old_node.city = node.city;
-                        // Don't care about "create" as that should be fixed anyway
-                        // Update certification type. It's technically possible for a node to jump
-                        // from DIY to certified and back in the same period, but practically that
-                        // should not happen.
-                        old_node.certification_type = node.certification;
-                        // It is possible that this also causes a node to get a different farming
-                        // policy ID.
-                        old_node.farming_policy_id = node.farming_policy_id;
-                        // Update connection price. This should not happen, but it is here in case
-                        // we modify the connection price of the node in place in the future and
-                        // emit this generic event when the 5 year fixed time is expired.
-                        old_node.connection_price = node.connection_price;
-                        // Even though this likely means the node is rebooted, don't mess with
-                        // uptime_info. The reboot will be detected in the `NodeUptimeReported`
-                        // handler.
-                        // This does not change when the node was connected.
-                        //
-                        // Once a VM, always a VM
-                        if node.virtualized {
-                            old_node.virtualized = node.virtualized;
-                        }
-                    }
-                    TFGridEvent::NodeUptimeReported(id, current_time, reported_uptime) => {
-                        // Sanity check the event, this should not be needed
-                        assert_eq!(current_time as i64, block.timestamp.timestamp());
-                        let node = match nodes.get_mut(&id) {
-                            Some(node) => node,
-                            None => panic!(
-                                "can't report uptime for unknown node {} in block {}",
-                                id, block.height
-                            ),
-                        };
-                        if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
-                            node.uptime_info
-                        {
-                            let report_delta = current_time as i64 - last_reported_at;
-                            let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
-                            // There are quite some situations here. Notice that due to the
-                            // blockchain only producing blocks every 6 seconds, and network delay
-                            // + a host of other issues, we will allow a node to report uptime with
-                            // "grace period" of a couple of minutes or so in either direction.
-                            //
-                            // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
-                            //    rubish.
-                            if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                                // This is possible if a node lags when sending uptime (extrinsic
-                                // takes a while to be accepted). Manual data validation found no
-                                // issues (i.e. all incidents of this type were a result of the
-                                // above). This should be changed in the future.
-                                total_uptime += uptime_delta as u64;
-                                node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
-                                continue;
-                            }
-                            // 2. The difference in uptime is within reason of the difference in
-                            //    report times, i.e. the node is properly reporting.
-                            if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
-                                && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
-                            {
-                                // It is technically possible for the delta to be less than 0 and
-                                // within the expected time frame. If nodes boot, send uptime, then
-                                // immediately reboot that is possible. In those cases, handle that
-                                // below, as that is the reboot detection.
-                                if uptime_delta > 0 {
-                                    // Simply add the uptime delta. If this is too large or low by a
-                                    // couple of seconds it will be corrected by the next pings anyhow.
-                                    total_uptime += uptime_delta as u64;
-                                    node.uptime_info =
-                                        Some((current_time as i64, reported_uptime, total_uptime));
-                                    continue;
-                                }
-                            }
-                            // 3. The difference in uptime is too low. Again there are multiple
-                            //    scenarios. Either way we consider the node rebooted. Depending on
-                            //    the reported uptime, the node reports legit uptime, or it reports
-                            //    an uptime which is too high.
-                            //
-                            //    1. Uptime is within bounds.
-                            if reported_uptime as i64 <= report_delta {
-                                total_uptime += reported_uptime;
-                                node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
-                                continue;
-                            }
-                            //    2. Uptime is higher than previously recorded uptime but too low.
-                            //    This might be a result off network congestion.
-                            if reported_uptime > last_reported_uptime {
-                                total_uptime += uptime_delta as u64;
-                                node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
-                                continue;
-                            }
-                            //    3. Uptime is too high, this is garbage
-                            if node.first_uptime_violation.is_none() {
-                                node.first_uptime_violation =
-                                    Some((last_reported_at, block.height));
-                            }
-                            continue;
-                        } else {
-                            let period_duration = current_time as i64 - start_ts;
-                            // Make sure we don't give more credit than the current length of the
-                            // period.
-                            let up_in_period =
-                                std::cmp::min(period_duration as u64, reported_uptime);
-                            // Save uptime info
-                            node.uptime_info =
-                                Some((current_time as i64, reported_uptime, up_in_period));
-                        }
-                    }
-                    _ => {}
-                },
-                TfchainEvent::SmartContract(contract_event) => match contract_event {
-                    SmartContractEvent::UpdatedUsedResources(contract_id, resources) => {
-                        let contract = match contracts.get_mut(&contract_id) {
-                            Some(contract) => contract,
-                            // Contract needs to exist.
-                            None => {
-                                panic!("Can't set used resources for contract {} which does not exist in block {}", contract_id, block.height);
-                            }
-                        };
-                        contract.resources = resources;
-                    }
-                    SmartContractEvent::NruConsumption(contract_id, timestamp, window, nru) => {
-                        let contract = match contracts.get_mut(&contract_id) {
-                            Some(contract) => contract,
-                            // Contract needs to exist.
-                            None => {
-                                panic!("Can't set used resources for contract {} which does not exist in block {}", contract_id, block.height);
-                            }
-                        };
-                        let node = match nodes.get_mut(&contract.node_id) {
-                            Some(node) => node,
-                            None => {
-                                panic!(
-                                    "can't process consumption for unknown node {} in block {}",
-                                    contract.node_id, block.height
-                                )
-                            }
-                        };
-                        // Just to make sure reports are ordered
-                        if timestamp as i64 <= contract.last_report_ts {
-                            // Silently ignore reports out of order, we already covered this in an
-                            // already processed consumption report. This can happen if the node pushes
-                            // a contract consumption report twice.
-                            continue;
-                        }
-
-                        // If report ts predates start we ignore it.
-                        if (timestamp as i64) < start_ts {
-                            continue;
-                        }
-                        node.capacity_consumption.cru += (contract.resources.cru * window) as u128;
-                        node.capacity_consumption.mru += (contract.resources.mru * window) as u128;
-                        node.capacity_consumption.hru += (contract.resources.hru * window) as u128;
-                        node.capacity_consumption.sru += (contract.resources.sru * window) as u128;
-                        node.capacity_consumption.ips += contract.ips as u64 * window;
-                        node.capacity_consumption.nru += nru;
-                        contract.last_report_ts = timestamp as i64;
-                    }
-                    SmartContractEvent::ContractCreated(contract) => {
-                        // we only care about node contracts
-                        if let ContractData::NodeContract(nc) = contract.contract_type {
-                            contracts.insert(
-                                contract.contract_id,
-                                Contract {
-                                    contract_id: contract.contract_id,
-                                    node_id: nc.node_id,
-                                    last_report_ts: block.timestamp.timestamp(),
-                                    ips: nc.public_ips,
-                                    resources: Resources::default(),
-                                },
-                            );
-                        };
-                    }
-                    SmartContractEvent::NodeContractCanceled(_, _, _) => {
-                        // We can't cancel the contract, as it might still receive a consumption
-                        // report. Technically we should check that only 1 final report is
-                        // received. But honestly it's the chain's job to make sure of that. Now,
-                        // considering IP, we will not do special handling, instead we rely on the
-                        // fact that IP reservations are only credited once a consumption report is
-                        // processed.
-                    }
-                    _ => {}
-                },
-                _ => {}
-            };
-        }
-
-        // update last height for sanity check
-        last_height = block.height;
-        // finally update progress bar
-        bar.set_message(block.timestamp.to_rfc2822());
-        bar.inc(1);
-    }
-
-    bar.finish();
-
-    println!("Getting uptime info from post period");
-    let block_stream = block_import(client, end_block, end_block + BLOCKS_IN_HOUR * 2, network);
-    let bar = ProgressBar::new(BLOCKS_IN_HOUR as u64 * 2);
-    bar.set_style(
-        ProgressStyle::default_bar()
-            .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
-    );
-
-    // Collect post-period uptime events. Violations don't matter here, those will be handled next
-    // period.
-    for block in block_stream {
-        for event in block.events {
-            if let TfchainEvent::TFGrid(event) = event {
-                if let TFGridEvent::NodeUptimeReported(id, current_time, reported_uptime) = *event {
-                    // Sanity check the event, this should not be needed
-                    assert_eq!(current_time as i64, block.timestamp.timestamp());
-                    let node = match nodes.get_mut(&id) {
-                        Some(node) => node,
-                        // This is possible if its an uptime report for a node which came online after
-                        // the period ended
-                        None => continue,
-                    };
-                    if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
-                        node.uptime_info
-                    {
-                        // only collect 1 uptime event after the period ended
-                        if last_reported_at >= end_ts {
-                            continue;
-                        }
-                        let report_delta = current_time as i64 - last_reported_at;
-                        let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
-                        let delta_in_period = end_ts - last_reported_at;
-                        // There are quite some situations here. Notice that due to the
-                        // blockchain only producing blocks every 6 seconds, and network delay
-                        // + a host of other issues, we will allow a node to report uptime with
-                        // "grace period" of a minute or so in either direction.
-                        //
-                        // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
-                        //    rubish.
-                        if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                            // This will actually be picked up next period as a violation if we
-                            // care for that.
-                            total_uptime += delta_in_period as u64;
-                            node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
-                            continue;
-                        }
-                        // 2. The difference in uptime is within reason of the difference in
-                        //    report times, i.e. the node is properly reporting.
-                        if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
-                            && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
-                        {
-                            // It is technically possible for the delta to be less than 0 and
-                            // within the expected time frame. If nodes boot, send uptime, then
-                            // immediately reboot that is possible. In those cases, handle that
-                            // below, as that is the reboot detection.
-                            if uptime_delta > 0 {
-                                // Simply add the uptime delta. If this is too large or low by a
-                                // couple of seconds it will be corrected by the next pings anyhow.
-                                //
-                                // Make sure we don't add too much based on the period.
-                                total_uptime += delta_in_period as u64;
-                                node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
-                                continue;
-                            }
-                        }
-                        // 3. The difference in uptime is too low. Again there are multiple
-                        //    scenarios. Either way we consider the node rebooted. Depending on
-                        //    the reported uptime, the node reports legit uptime, or it reports
-                        //    an uptime which is too high.
-                        //
-                        //    1. Uptime is within bounds.
-                        if reported_uptime as i64 <= report_delta {
-                            // Account for the fact that we are actually out of the period
-                            let out_of_period = current_time - end_ts as u64;
-                            if out_of_period < reported_uptime {
-                                total_uptime += reported_uptime - out_of_period;
-                            }
-                            node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
-                            continue;
-                        }
-                        //    2. Uptime is higher than previously recorded uptime but too low.
-                        //    This might be a result off network congestion.
-                        if reported_uptime > last_reported_uptime {
-                            total_uptime += uptime_delta as u64;
-                            node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
-                            continue;
-                        }
-                        //    3. Uptime is too high, this is garbage
-                        if node.first_uptime_violation.is_none() {
-                            node.first_uptime_violation = Some((last_reported_at, block.height));
-                            continue;
-                        }
-
-                        // We should have handled all cases. Make this explicit here.
-                        unreachable!();
-                    }
-                }
-            }
-        }
-
-        bar.set_message(block.timestamp.to_rfc2822());
-        bar.inc(1)
-    }
-    bar.finish_and_clear();
-
-    let mut receipts = BTreeMap::new();
-    let mut payout_file = std::fs::File::create("payouts.csv").unwrap();
-    let mut overview_file = std::fs::File::create("overview.csv").unwrap();
-    let mut retry_file = std::fs::File::create("retries.csv").unwrap();
-
-    let mut carbon_tft_units = 0;
-
-    writeln!(overview_file,"node id,twin id,farm name (farm id),period start,period end,measured uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,carbon offset USD generated,carbon offset TFT generated,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,Virtualized,violation,stellar address").unwrap();
-    for (_, node) in nodes {
-        let node_period = node.real_period(period);
-        let node_period_duration = node_period.duration();
-        let node_start = Utc.timestamp(node_period.start(), 0);
-        let node_end = Utc.timestamp(node_period.end(), 0);
-        let (cu, su, nu) = node.cloud_units_permill();
-        let (musd, tft) = node.scaled_payout(period, &farming_policies);
-        let (co_musd, co_tft) = node.scaled_carbon_payout(period);
-        let cru_used = (node.capacity_consumption.cru / node_period_duration as u128) as u64;
-        let mru_used = (node.capacity_consumption.mru / node_period_duration as u128) as u64;
-        let hru_used = (node.capacity_consumption.hru / node_period_duration as u128) as u64;
-        let sru_used = (node.capacity_consumption.sru / node_period_duration as u128) as u64;
-        let farm = if let Some(farm) = farms.get(&node.farm_id) {
-            farm
-        } else {
-            println!(
-                "node {} is in farm {} which does not exist anymore",
-                node.id, node.farm_id
-            );
-            continue;
-        };
-        let stellar_address = if let Some(stellar_address) = payout_addresses.get(&node.farm_id) {
-            &stellar_address
-        } else {
-            ""
-        };
-        writeln!(overview_file,
-            "{},{},{} ({}),{},{},{},{},{},{},{} $,{},{} $,{} $,{} TFT,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{},{},{}",
-            node.id,
-            node.twin_id,
-            farm.name,
-            node.farm_id,
-            node_start,
-            node_end,
-            node.uptime(period),
-            format_args!("{}.{:06}", cu / ONE_MILL as u64, cu % ONE_MILL as u64),
-            format_args!("{}.{:06}", su / ONE_MILL as u64, su % ONE_MILL as u64),
-            format_args!("{}.{:06}", nu / ONE_MILL as u64, nu % ONE_MILL as u64),
-            format_args!("{}.{:03}", musd / 1_000, musd % 1_000),
-            format_args!("{}.{:07}", tft / UNITS_PER_TFT, tft % UNITS_PER_TFT),
-            format_args!(
-                "{}.{:03}",
-                node.connection_price / 1_000,
-                node.connection_price % 1_000
-            ),
-            format_args!("{}.{:03}", co_musd / 1_000, co_musd % 1_000),
-            format_args!("{}.{:07}", co_tft / UNITS_PER_TFT, co_tft % UNITS_PER_TFT),
-            node.resources.cru,
-            if node.resources.cru > 0 {cru_used as f64 * 100. / node.resources.cru as f64} else { 0.},
-            node.resources.mru,
-            if node.resources.mru > 0 {mru_used as f64 * 100. / node.resources.mru as f64} else {0.},
-            node.resources.hru,
-            if node.resources.hru > 0 {hru_used as f64 * 100. / node.resources.hru as f64} else {0.},
-            node.resources.sru,
-            if node.resources.sru > 0 {sru_used as f64 * 100. / node.resources.sru as f64} else {0.},
-            node.capacity_consumption.ips as f64 / 3600.,
-            if let NodeCertification::Certified = node.certification_type {
-                "CERTIFIED"
-            } else {
-                "DIY"
-            },
-            node.virtualized,
-            if let Some((lra, violation)) = node.first_uptime_violation {
-                format!("violation of uptime measurement in block {} (previous report {})", violation, lra)
-            } else {
-                "".into()
-            },
-            stellar_address,
-        ).unwrap();
-
-        let receipt = node.receipt(period, &farms, &payout_addresses, &farming_policies);
-        if !stellar_address.is_empty() && tft != 0 {
-            writeln!(
-                payout_file,
-                "{},{}.{:07},{}",
-                stellar_address,
-                tft / UNITS_PER_TFT,
-                tft % UNITS_PER_TFT,
-                hex::encode(receipt.hash()),
-            )
-            .unwrap();
-        }
-        receipts.insert(receipt.hash(), receipt);
-
-        // Count carbon TFT credits
-        carbon_tft_units += co_tft;
-    }
-
-    // Retry payments once
-    let mut retry_receipts = HashMap::new();
-    for (hash, failed_receipt) in previous_receipts {
-        // no point in doing this
-        if failed_receipt.reward.tft == 0 {
-            continue;
-        }
-        let retry_receipt = RetryPayoutReceipt {
-            failed_payout_period: failed_receipt.period,
-            retry_period: period,
-            farm_id: failed_receipt.farm_id,
-            previous_stellar_payout_address: failed_receipt.stellar_payout_address,
-            stellar_payout_address: payout_addresses
-                .get(&failed_receipt.farm_id)
-                .map(|a| a.clone())
-                .unwrap_or("".to_string()),
-            retry_for_receipt: hex::encode(hash),
-            reward: failed_receipt.reward,
-        };
-        let retry_hash = hex::encode(retry_receipt.hash());
-
-        if !retry_receipt.stellar_payout_address.is_empty() && retry_receipt.reward.tft != 0 {
-            writeln!(
-                payout_file,
-                "{},{}.{:07},{}",
-                retry_receipt.stellar_payout_address,
-                retry_receipt.reward.tft / UNITS_PER_TFT,
-                retry_receipt.reward.tft % UNITS_PER_TFT,
-                retry_hash,
-            )
-            .unwrap();
-        }
-
-        retry_receipts.insert(retry_hash, retry_receipt);
-    }
-
-    let mut retry_fixed_receipts = HashMap::new();
-    for (hash, failed_receipt) in previous_fixup_receipts {
-        // no point in doing this
-        if failed_receipt.fixup_reward.tft == 0 {
-            continue;
-        }
-        let retry_receipt = RetryPayoutReceipt {
-            failed_payout_period: failed_receipt.period,
-            retry_period: period,
-            farm_id: failed_receipt.farm_id,
-            previous_stellar_payout_address: failed_receipt.stellar_payout_address,
-            stellar_payout_address: payout_addresses
-                .get(&failed_receipt.farm_id)
-                .map(|a| a.clone())
-                .unwrap_or("".to_string()),
-            retry_for_receipt: hex::encode(hash),
-            reward: failed_receipt.fixup_reward,
-        };
-        let retry_hash = hex::encode(retry_receipt.hash());
-
-        if !retry_receipt.stellar_payout_address.is_empty() && retry_receipt.reward.tft != 0 {
-            writeln!(
-                payout_file,
-                "{},{}.{:07},{}",
-                retry_receipt.stellar_payout_address,
-                retry_receipt.reward.tft / UNITS_PER_TFT,
-                retry_receipt.reward.tft % UNITS_PER_TFT,
-                retry_hash,
-            )
-            .unwrap();
-        }
-
-        retry_fixed_receipts.insert(retry_hash, retry_receipt);
-    }
-
-    // Sort hashes in lexicographical order
-    let mut receipt_hashes = receipts.keys().cloned().collect::<Vec<_>>();
-    receipt_hashes.sort_unstable();
-    let mut hasher = Blake2b::<U32>::new();
-    for receipt_hash in receipt_hashes {
-        hasher.update(receipt_hash);
-    }
-    let carbon_hash: [u8; 32] = hasher.finalize().into();
-    writeln!(
-        payout_file,
-        "{},{}.{:07},{}",
-        CARBON_CREDIT_ADDRESS,
-        carbon_tft_units / UNITS_PER_TFT,
-        carbon_tft_units % UNITS_PER_TFT,
-        hex::encode(carbon_hash),
-    )
-    .unwrap();
-
-    // Write generated receipts
-    let mut receipt_dir = path::PathBuf::new();
-    receipt_dir.push("receipts");
-    receipt_dir.push(period_offset.to_string());
-    std::fs::create_dir_all(&receipt_dir).unwrap();
-    for (hash, receipt) in receipts {
-        let mut path = receipt_dir.clone();
-        path.push(hex::encode(hash));
-        std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
-    }
-
-    // Write retry receipts
-    writeln!(
-        retry_file,
-        "farm_id,previous_stellar_address,new_stellar_address,amount TFT,retry_for",
-    )
-    .unwrap();
-
-    let mut retry_receipt_dir = path::PathBuf::new();
-    retry_receipt_dir.push("receipts");
-    retry_receipt_dir.push("retries");
-    retry_receipt_dir.push(period_offset.to_string());
-    std::fs::create_dir_all(&retry_receipt_dir).unwrap();
-    for (hash, receipt) in retry_receipts {
-        writeln!(
-            retry_file,
-            "{},{},{},{}.{:07},{}",
-            receipt.farm_id,
-            receipt.previous_stellar_payout_address,
-            receipt.stellar_payout_address,
-            receipt.reward.tft / UNITS_PER_TFT,
-            receipt.reward.tft % UNITS_PER_TFT,
-            receipt.retry_for_receipt,
-        )
+    std::fs::File::create("nodes.bin")
+        .unwrap()
+        .write_all(&encoded_nodes)
         .unwrap();
-        let mut path = retry_receipt_dir.clone();
-        path.push(hash);
-        std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
-    }
-    for (hash, receipt) in retry_fixed_receipts {
-        writeln!(
-            retry_file,
-            "{},{},{},{}.{:07},{}",
-            receipt.farm_id,
-            receipt.previous_stellar_payout_address,
-            receipt.stellar_payout_address,
-            receipt.reward.tft / UNITS_PER_TFT,
-            receipt.reward.tft % UNITS_PER_TFT,
-            receipt.retry_for_receipt,
-        )
+    std::fs::File::create("farms.bin")
+        .unwrap()
+        .write_all(&encoded_farms)
         .unwrap();
-        let mut path = retry_receipt_dir.clone();
-        path.push(hash);
-        std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
-    }
+    std::fs::File::create("payout_addresses.bin")
+        .unwrap()
+        .write_all(&encoded_payout_addresses)
+        .unwrap();
+    std::fs::File::create("contracts.bin")
+        .unwrap()
+        .write_all(&encoded_contracts)
+        .unwrap();
+    std::fs::File::create("farming_policies.bin")
+        .unwrap()
+        .write_all(&encoded_farming_policies)
+        .unwrap();
+    // DONE here
+    return;
+
+    // println!("Setup block import pipeline");
+    // let blocks = end_block - start_block + 1;
+    // let block_stream = block_import(client.clone(), start_block, end_block, network);
+
+    // let bar = ProgressBar::new(blocks as u64);
+    // bar.set_style(
+    //     ProgressStyle::default_bar()
+    //         .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
+    // );
+    // let mut last_height = start_block - 1;
+    // for block in block_stream {
+    //     assert_eq!(block.height, last_height + 1);
+
+    //     for event in block.events {
+    //         match event {
+    //             TfchainEvent::TFGrid(grid_event) => match *grid_event {
+    //                 TFGridEvent::NodeStored(node) => {
+    //                     nodes.insert(
+    //                         node.id,
+    //                         MintingNode {
+    //                             id: node.id,
+    //                             farm_id: node.farm_id,
+    //                             twin_id: node.twin_id,
+    //                             resources: node.resources,
+    //                             location: node.location,
+    //                             country: node.country,
+    //                             city: node.city,
+    //                             created: node.created,
+    //                             certification_type: node.certification,
+    //                             uptime_info: None,
+    //                             first_uptime_violation: None,
+    //                             connected: NodeConnected::Current(block.timestamp.timestamp()),
+    //                             connection_price: node.connection_price,
+    //                             capacity_consumption: TotalConsumption::default(),
+    //                             virtualized: node.virtualized,
+    //                             farming_policy_id: node.farming_policy_id,
+    //                         },
+    //                     );
+    //                 }
+    //                 TFGridEvent::NodeUpdated(node) => {
+    //                     let old_node = nodes
+    //                         .get_mut(&node.id)
+    //                         .expect("node update of unknown node");
+    //                     old_node.farm_id = node.farm_id;
+    //                     old_node.twin_id = node.twin_id;
+    //                     // update resources, but only lower them in case of dead or removed
+    //                     // hardware. Do not update in case of added hardware as this is currently
+    //                     // unresolved.
+    //                     old_node.resources.cru =
+    //                         std::cmp::min(old_node.resources.cru, node.resources.cru);
+    //                     old_node.resources.mru =
+    //                         std::cmp::min(old_node.resources.mru, node.resources.mru);
+    //                     old_node.resources.hru =
+    //                         std::cmp::min(old_node.resources.hru, node.resources.hru);
+    //                     old_node.resources.sru =
+    //                         std::cmp::min(old_node.resources.sru, node.resources.sru);
+    //                     old_node.location = node.location;
+    //                     old_node.resources = node.resources;
+    //                     old_node.country = node.country;
+    //                     old_node.city = node.city;
+    //                     // Don't care about "create" as that should be fixed anyway
+    //                     // Update certification type. It's technically possible for a node to jump
+    //                     // from DIY to certified and back in the same period, but practically that
+    //                     // should not happen.
+    //                     old_node.certification_type = node.certification;
+    //                     // It is possible that this also causes a node to get a different farming
+    //                     // policy ID.
+    //                     old_node.farming_policy_id = node.farming_policy_id;
+    //                     // Update connection price. This should not happen, but it is here in case
+    //                     // we modify the connection price of the node in place in the future and
+    //                     // emit this generic event when the 5 year fixed time is expired.
+    //                     old_node.connection_price = node.connection_price;
+    //                     // Even though this likely means the node is rebooted, don't mess with
+    //                     // uptime_info. The reboot will be detected in the `NodeUptimeReported`
+    //                     // handler.
+    //                     // This does not change when the node was connected.
+    //                     //
+    //                     // Once a VM, always a VM
+    //                     if node.virtualized {
+    //                         old_node.virtualized = node.virtualized;
+    //                     }
+    //                 }
+    //                 TFGridEvent::NodeUptimeReported(id, current_time, reported_uptime) => {
+    //                     // Sanity check the event, this should not be needed
+    //                     assert_eq!(current_time as i64, block.timestamp.timestamp());
+    //                     let node = match nodes.get_mut(&id) {
+    //                         Some(node) => node,
+    //                         None => panic!(
+    //                             "can't report uptime for unknown node {} in block {}",
+    //                             id, block.height
+    //                         ),
+    //                     };
+    //                     if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
+    //                         node.uptime_info
+    //                     {
+    //                         let report_delta = current_time as i64 - last_reported_at;
+    //                         let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
+    //                         // There are quite some situations here. Notice that due to the
+    //                         // blockchain only producing blocks every 6 seconds, and network delay
+    //                         // + a host of other issues, we will allow a node to report uptime with
+    //                         // "grace period" of a couple of minutes or so in either direction.
+    //                         //
+    //                         // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
+    //                         //    rubish.
+    //                         if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
+    //                             // This is possible if a node lags when sending uptime (extrinsic
+    //                             // takes a while to be accepted). Manual data validation found no
+    //                             // issues (i.e. all incidents of this type were a result of the
+    //                             // above). This should be changed in the future.
+    //                             total_uptime += uptime_delta as u64;
+    //                             node.uptime_info =
+    //                                 Some((current_time as i64, reported_uptime, total_uptime));
+    //                             continue;
+    //                         }
+    //                         // 2. The difference in uptime is within reason of the difference in
+    //                         //    report times, i.e. the node is properly reporting.
+    //                         if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
+    //                             && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+    //                         {
+    //                             // It is technically possible for the delta to be less than 0 and
+    //                             // within the expected time frame. If nodes boot, send uptime, then
+    //                             // immediately reboot that is possible. In those cases, handle that
+    //                             // below, as that is the reboot detection.
+    //                             if uptime_delta > 0 {
+    //                                 // Simply add the uptime delta. If this is too large or low by a
+    //                                 // couple of seconds it will be corrected by the next pings anyhow.
+    //                                 total_uptime += uptime_delta as u64;
+    //                                 node.uptime_info =
+    //                                     Some((current_time as i64, reported_uptime, total_uptime));
+    //                                 continue;
+    //                             }
+    //                         }
+    //                         // 3. The difference in uptime is too low. Again there are multiple
+    //                         //    scenarios. Either way we consider the node rebooted. Depending on
+    //                         //    the reported uptime, the node reports legit uptime, or it reports
+    //                         //    an uptime which is too high.
+    //                         //
+    //                         //    1. Uptime is within bounds.
+    //                         if reported_uptime as i64 <= report_delta {
+    //                             total_uptime += reported_uptime;
+    //                             node.uptime_info =
+    //                                 Some((current_time as i64, reported_uptime, total_uptime));
+    //                             continue;
+    //                         }
+    //                         //    2. Uptime is higher than previously recorded uptime but too low.
+    //                         //    This might be a result off network congestion.
+    //                         if reported_uptime > last_reported_uptime {
+    //                             total_uptime += uptime_delta as u64;
+    //                             node.uptime_info =
+    //                                 Some((current_time as i64, reported_uptime, total_uptime));
+    //                             continue;
+    //                         }
+    //                         //    3. Uptime is too high, this is garbage
+    //                         if node.first_uptime_violation.is_none() {
+    //                             node.first_uptime_violation =
+    //                                 Some((last_reported_at, block.height));
+    //                         }
+    //                         continue;
+    //                     } else {
+    //                         let period_duration = current_time as i64 - start_ts;
+    //                         // Make sure we don't give more credit than the current length of the
+    //                         // period.
+    //                         let up_in_period =
+    //                             std::cmp::min(period_duration as u64, reported_uptime);
+    //                         // Save uptime info
+    //                         node.uptime_info =
+    //                             Some((current_time as i64, reported_uptime, up_in_period));
+    //                     }
+    //                 }
+    //                 _ => {}
+    //             },
+    //             TfchainEvent::SmartContract(contract_event) => match contract_event {
+    //                 SmartContractEvent::UpdatedUsedResources(contract_id, resources) => {
+    //                     let contract = match contracts.get_mut(&contract_id) {
+    //                         Some(contract) => contract,
+    //                         // Contract needs to exist.
+    //                         None => {
+    //                             panic!("Can't set used resources for contract {} which does not exist in block {}", contract_id, block.height);
+    //                         }
+    //                     };
+    //                     contract.resources = resources;
+    //                 }
+    //                 SmartContractEvent::NruConsumption(contract_id, timestamp, window, nru) => {
+    //                     let contract = match contracts.get_mut(&contract_id) {
+    //                         Some(contract) => contract,
+    //                         // Contract needs to exist.
+    //                         None => {
+    //                             panic!("Can't set used resources for contract {} which does not exist in block {}", contract_id, block.height);
+    //                         }
+    //                     };
+    //                     let node = match nodes.get_mut(&contract.node_id) {
+    //                         Some(node) => node,
+    //                         None => {
+    //                             panic!(
+    //                                 "can't process consumption for unknown node {} in block {}",
+    //                                 contract.node_id, block.height
+    //                             )
+    //                         }
+    //                     };
+    //                     // Just to make sure reports are ordered
+    //                     if timestamp as i64 <= contract.last_report_ts {
+    //                         // Silently ignore reports out of order, we already covered this in an
+    //                         // already processed consumption report. This can happen if the node pushes
+    //                         // a contract consumption report twice.
+    //                         continue;
+    //                     }
+
+    //                     // If report ts predates start we ignore it.
+    //                     if (timestamp as i64) < start_ts {
+    //                         continue;
+    //                     }
+    //                     node.capacity_consumption.cru += (contract.resources.cru * window) as u128;
+    //                     node.capacity_consumption.mru += (contract.resources.mru * window) as u128;
+    //                     node.capacity_consumption.hru += (contract.resources.hru * window) as u128;
+    //                     node.capacity_consumption.sru += (contract.resources.sru * window) as u128;
+    //                     node.capacity_consumption.ips += contract.ips as u64 * window;
+    //                     node.capacity_consumption.nru += nru;
+    //                     contract.last_report_ts = timestamp as i64;
+    //                 }
+    //                 SmartContractEvent::ContractCreated(contract) => {
+    //                     // we only care about node contracts
+    //                     if let ContractData::NodeContract(nc) = contract.contract_type {
+    //                         contracts.insert(
+    //                             contract.contract_id,
+    //                             Contract {
+    //                                 contract_id: contract.contract_id,
+    //                                 node_id: nc.node_id,
+    //                                 last_report_ts: block.timestamp.timestamp(),
+    //                                 ips: nc.public_ips,
+    //                                 resources: Resources::default(),
+    //                             },
+    //                         );
+    //                     };
+    //                 }
+    //                 SmartContractEvent::NodeContractCanceled(_, _, _) => {
+    //                     // We can't cancel the contract, as it might still receive a consumption
+    //                     // report. Technically we should check that only 1 final report is
+    //                     // received. But honestly it's the chain's job to make sure of that. Now,
+    //                     // considering IP, we will not do special handling, instead we rely on the
+    //                     // fact that IP reservations are only credited once a consumption report is
+    //                     // processed.
+    //                 }
+    //                 _ => {}
+    //             },
+    //             _ => {}
+    //         };
+    //     }
+
+    //     // update last height for sanity check
+    //     last_height = block.height;
+    //     // finally update progress bar
+    //     bar.set_message(block.timestamp.to_rfc2822());
+    //     bar.inc(1);
+    // }
+
+    // bar.finish();
+
+    // println!("Getting uptime info from post period");
+    // let block_stream = block_import(client, end_block, end_block + BLOCKS_IN_HOUR * 2, network);
+    // let bar = ProgressBar::new(BLOCKS_IN_HOUR as u64 * 2);
+    // bar.set_style(
+    //     ProgressStyle::default_bar()
+    //         .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
+    // );
+
+    // // Collect post-period uptime events. Violations don't matter here, those will be handled next
+    // // period.
+    // for block in block_stream {
+    //     for event in block.events {
+    //         if let TfchainEvent::TFGrid(event) = event {
+    //             if let TFGridEvent::NodeUptimeReported(id, current_time, reported_uptime) = *event {
+    //                 // Sanity check the event, this should not be needed
+    //                 assert_eq!(current_time as i64, block.timestamp.timestamp());
+    //                 let node = match nodes.get_mut(&id) {
+    //                     Some(node) => node,
+    //                     // This is possible if its an uptime report for a node which came online after
+    //                     // the period ended
+    //                     None => continue,
+    //                 };
+    //                 if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
+    //                     node.uptime_info
+    //                 {
+    //                     // only collect 1 uptime event after the period ended
+    //                     if last_reported_at >= end_ts {
+    //                         continue;
+    //                     }
+    //                     let report_delta = current_time as i64 - last_reported_at;
+    //                     let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
+    //                     let delta_in_period = end_ts - last_reported_at;
+    //                     // There are quite some situations here. Notice that due to the
+    //                     // blockchain only producing blocks every 6 seconds, and network delay
+    //                     // + a host of other issues, we will allow a node to report uptime with
+    //                     // "grace period" of a minute or so in either direction.
+    //                     //
+    //                     // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
+    //                     //    rubish.
+    //                     if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
+    //                         // This will actually be picked up next period as a violation if we
+    //                         // care for that.
+    //                         total_uptime += delta_in_period as u64;
+    //                         node.uptime_info =
+    //                             Some((current_time as i64, reported_uptime, total_uptime));
+    //                         continue;
+    //                     }
+    //                     // 2. The difference in uptime is within reason of the difference in
+    //                     //    report times, i.e. the node is properly reporting.
+    //                     if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
+    //                         && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+    //                     {
+    //                         // It is technically possible for the delta to be less than 0 and
+    //                         // within the expected time frame. If nodes boot, send uptime, then
+    //                         // immediately reboot that is possible. In those cases, handle that
+    //                         // below, as that is the reboot detection.
+    //                         if uptime_delta > 0 {
+    //                             // Simply add the uptime delta. If this is too large or low by a
+    //                             // couple of seconds it will be corrected by the next pings anyhow.
+    //                             //
+    //                             // Make sure we don't add too much based on the period.
+    //                             total_uptime += delta_in_period as u64;
+    //                             node.uptime_info =
+    //                                 Some((current_time as i64, reported_uptime, total_uptime));
+    //                             continue;
+    //                         }
+    //                     }
+    //                     // 3. The difference in uptime is too low. Again there are multiple
+    //                     //    scenarios. Either way we consider the node rebooted. Depending on
+    //                     //    the reported uptime, the node reports legit uptime, or it reports
+    //                     //    an uptime which is too high.
+    //                     //
+    //                     //    1. Uptime is within bounds.
+    //                     if reported_uptime as i64 <= report_delta {
+    //                         // Account for the fact that we are actually out of the period
+    //                         let out_of_period = current_time - end_ts as u64;
+    //                         if out_of_period < reported_uptime {
+    //                             total_uptime += reported_uptime - out_of_period;
+    //                         }
+    //                         node.uptime_info =
+    //                             Some((current_time as i64, reported_uptime, total_uptime));
+    //                         continue;
+    //                     }
+    //                     //    2. Uptime is higher than previously recorded uptime but too low.
+    //                     //    This might be a result off network congestion.
+    //                     if reported_uptime > last_reported_uptime {
+    //                         total_uptime += uptime_delta as u64;
+    //                         node.uptime_info =
+    //                             Some((current_time as i64, reported_uptime, total_uptime));
+    //                         continue;
+    //                     }
+    //                     //    3. Uptime is too high, this is garbage
+    //                     if node.first_uptime_violation.is_none() {
+    //                         node.first_uptime_violation = Some((last_reported_at, block.height));
+    //                         continue;
+    //                     }
+
+    //                     // We should have handled all cases. Make this explicit here.
+    //                     unreachable!();
+    //                 }
+    //             }
+    //         }
+    //     }
+
+    //     bar.set_message(block.timestamp.to_rfc2822());
+    //     bar.inc(1)
+    // }
+    // bar.finish_and_clear();
+
+    // let mut receipts = BTreeMap::new();
+    // let mut payout_file = std::fs::File::create("payouts.csv").unwrap();
+    // let mut overview_file = std::fs::File::create("overview.csv").unwrap();
+    // let mut retry_file = std::fs::File::create("retries.csv").unwrap();
+
+    // let mut carbon_tft_units = 0;
+
+    // writeln!(overview_file,"node id,twin id,farm name (farm id),period start,period end,measured uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,carbon offset USD generated,carbon offset TFT generated,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,Virtualized,violation,stellar address").unwrap();
+    // for (_, node) in nodes {
+    //     let node_period = node.real_period(period);
+    //     let node_period_duration = node_period.duration();
+    //     let node_start = Utc.timestamp(node_period.start(), 0);
+    //     let node_end = Utc.timestamp(node_period.end(), 0);
+    //     let (cu, su, nu) = node.cloud_units_permill();
+    //     let (musd, tft) = node.scaled_payout(period, &farming_policies);
+    //     let (co_musd, co_tft) = node.scaled_carbon_payout(period);
+    //     let cru_used = (node.capacity_consumption.cru / node_period_duration as u128) as u64;
+    //     let mru_used = (node.capacity_consumption.mru / node_period_duration as u128) as u64;
+    //     let hru_used = (node.capacity_consumption.hru / node_period_duration as u128) as u64;
+    //     let sru_used = (node.capacity_consumption.sru / node_period_duration as u128) as u64;
+    //     let farm = if let Some(farm) = farms.get(&node.farm_id) {
+    //         farm
+    //     } else {
+    //         println!(
+    //             "node {} is in farm {} which does not exist anymore",
+    //             node.id, node.farm_id
+    //         );
+    //         continue;
+    //     };
+    //     let stellar_address = if let Some(stellar_address) = payout_addresses.get(&node.farm_id) {
+    //         &stellar_address
+    //     } else {
+    //         ""
+    //     };
+    //     writeln!(overview_file,
+    //         "{},{},{} ({}),{},{},{},{},{},{},{} $,{},{} $,{} $,{} TFT,{},{:.2}%,{},{:.2}%,{},{:.2}%,{},{:.2}%,{:.2} hours,{},{},{},{}",
+    //         node.id,
+    //         node.twin_id,
+    //         farm.name,
+    //         node.farm_id,
+    //         node_start,
+    //         node_end,
+    //         node.uptime(period),
+    //         format_args!("{}.{:06}", cu / ONE_MILL as u64, cu % ONE_MILL as u64),
+    //         format_args!("{}.{:06}", su / ONE_MILL as u64, su % ONE_MILL as u64),
+    //         format_args!("{}.{:06}", nu / ONE_MILL as u64, nu % ONE_MILL as u64),
+    //         format_args!("{}.{:03}", musd / 1_000, musd % 1_000),
+    //         format_args!("{}.{:07}", tft / UNITS_PER_TFT, tft % UNITS_PER_TFT),
+    //         format_args!(
+    //             "{}.{:03}",
+    //             node.connection_price / 1_000,
+    //             node.connection_price % 1_000
+    //         ),
+    //         format_args!("{}.{:03}", co_musd / 1_000, co_musd % 1_000),
+    //         format_args!("{}.{:07}", co_tft / UNITS_PER_TFT, co_tft % UNITS_PER_TFT),
+    //         node.resources.cru,
+    //         if node.resources.cru > 0 {cru_used as f64 * 100. / node.resources.cru as f64} else { 0.},
+    //         node.resources.mru,
+    //         if node.resources.mru > 0 {mru_used as f64 * 100. / node.resources.mru as f64} else {0.},
+    //         node.resources.hru,
+    //         if node.resources.hru > 0 {hru_used as f64 * 100. / node.resources.hru as f64} else {0.},
+    //         node.resources.sru,
+    //         if node.resources.sru > 0 {sru_used as f64 * 100. / node.resources.sru as f64} else {0.},
+    //         node.capacity_consumption.ips as f64 / 3600.,
+    //         if let NodeCertification::Certified = node.certification_type {
+    //             "CERTIFIED"
+    //         } else {
+    //             "DIY"
+    //         },
+    //         node.virtualized,
+    //         if let Some((lra, violation)) = node.first_uptime_violation {
+    //             format!("violation of uptime measurement in block {} (previous report {})", violation, lra)
+    //         } else {
+    //             "".into()
+    //         },
+    //         stellar_address,
+    //     ).unwrap();
+
+    //     let receipt = node.receipt(period, &farms, &payout_addresses, &farming_policies);
+    //     if !stellar_address.is_empty() && tft != 0 {
+    //         writeln!(
+    //             payout_file,
+    //             "{},{}.{:07},{}",
+    //             stellar_address,
+    //             tft / UNITS_PER_TFT,
+    //             tft % UNITS_PER_TFT,
+    //             hex::encode(receipt.hash()),
+    //         )
+    //         .unwrap();
+    //     }
+    //     receipts.insert(receipt.hash(), receipt);
+
+    //     // Count carbon TFT credits
+    //     carbon_tft_units += co_tft;
+    // }
+
+    // // Retry payments once
+    // let mut retry_receipts = HashMap::new();
+    // for (hash, failed_receipt) in previous_receipts {
+    //     // no point in doing this
+    //     if failed_receipt.reward.tft == 0 {
+    //         continue;
+    //     }
+    //     let retry_receipt = RetryPayoutReceipt {
+    //         failed_payout_period: failed_receipt.period,
+    //         retry_period: period,
+    //         farm_id: failed_receipt.farm_id,
+    //         previous_stellar_payout_address: failed_receipt.stellar_payout_address,
+    //         stellar_payout_address: payout_addresses
+    //             .get(&failed_receipt.farm_id)
+    //             .map(|a| a.clone())
+    //             .unwrap_or("".to_string()),
+    //         retry_for_receipt: hex::encode(hash),
+    //         reward: failed_receipt.reward,
+    //     };
+    //     let retry_hash = hex::encode(retry_receipt.hash());
+
+    //     if !retry_receipt.stellar_payout_address.is_empty() && retry_receipt.reward.tft != 0 {
+    //         writeln!(
+    //             payout_file,
+    //             "{},{}.{:07},{}",
+    //             retry_receipt.stellar_payout_address,
+    //             retry_receipt.reward.tft / UNITS_PER_TFT,
+    //             retry_receipt.reward.tft % UNITS_PER_TFT,
+    //             retry_hash,
+    //         )
+    //         .unwrap();
+    //     }
+
+    //     retry_receipts.insert(retry_hash, retry_receipt);
+    // }
+
+    // let mut retry_fixed_receipts = HashMap::new();
+    // for (hash, failed_receipt) in previous_fixup_receipts {
+    //     // no point in doing this
+    //     if failed_receipt.fixup_reward.tft == 0 {
+    //         continue;
+    //     }
+    //     let retry_receipt = RetryPayoutReceipt {
+    //         failed_payout_period: failed_receipt.period,
+    //         retry_period: period,
+    //         farm_id: failed_receipt.farm_id,
+    //         previous_stellar_payout_address: failed_receipt.stellar_payout_address,
+    //         stellar_payout_address: payout_addresses
+    //             .get(&failed_receipt.farm_id)
+    //             .map(|a| a.clone())
+    //             .unwrap_or("".to_string()),
+    //         retry_for_receipt: hex::encode(hash),
+    //         reward: failed_receipt.fixup_reward,
+    //     };
+    //     let retry_hash = hex::encode(retry_receipt.hash());
+
+    //     if !retry_receipt.stellar_payout_address.is_empty() && retry_receipt.reward.tft != 0 {
+    //         writeln!(
+    //             payout_file,
+    //             "{},{}.{:07},{}",
+    //             retry_receipt.stellar_payout_address,
+    //             retry_receipt.reward.tft / UNITS_PER_TFT,
+    //             retry_receipt.reward.tft % UNITS_PER_TFT,
+    //             retry_hash,
+    //         )
+    //         .unwrap();
+    //     }
+
+    //     retry_fixed_receipts.insert(retry_hash, retry_receipt);
+    // }
+
+    // // Sort hashes in lexicographical order
+    // let mut receipt_hashes = receipts.keys().cloned().collect::<Vec<_>>();
+    // receipt_hashes.sort_unstable();
+    // let mut hasher = Blake2b::<U32>::new();
+    // for receipt_hash in receipt_hashes {
+    //     hasher.update(receipt_hash);
+    // }
+    // let carbon_hash: [u8; 32] = hasher.finalize().into();
+    // writeln!(
+    //     payout_file,
+    //     "{},{}.{:07},{}",
+    //     CARBON_CREDIT_ADDRESS,
+    //     carbon_tft_units / UNITS_PER_TFT,
+    //     carbon_tft_units % UNITS_PER_TFT,
+    //     hex::encode(carbon_hash),
+    // )
+    // .unwrap();
+
+    // // Write generated receipts
+    // let mut receipt_dir = path::PathBuf::new();
+    // receipt_dir.push("receipts");
+    // receipt_dir.push(period_offset.to_string());
+    // std::fs::create_dir_all(&receipt_dir).unwrap();
+    // for (hash, receipt) in receipts {
+    //     let mut path = receipt_dir.clone();
+    //     path.push(hex::encode(hash));
+    //     std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    // }
+
+    // // Write retry receipts
+    // writeln!(
+    //     retry_file,
+    //     "farm_id,previous_stellar_address,new_stellar_address,amount TFT,retry_for",
+    // )
+    // .unwrap();
+
+    // let mut retry_receipt_dir = path::PathBuf::new();
+    // retry_receipt_dir.push("receipts");
+    // retry_receipt_dir.push("retries");
+    // retry_receipt_dir.push(period_offset.to_string());
+    // std::fs::create_dir_all(&retry_receipt_dir).unwrap();
+    // for (hash, receipt) in retry_receipts {
+    //     writeln!(
+    //         retry_file,
+    //         "{},{},{},{}.{:07},{}",
+    //         receipt.farm_id,
+    //         receipt.previous_stellar_payout_address,
+    //         receipt.stellar_payout_address,
+    //         receipt.reward.tft / UNITS_PER_TFT,
+    //         receipt.reward.tft % UNITS_PER_TFT,
+    //         receipt.retry_for_receipt,
+    //     )
+    //     .unwrap();
+    //     let mut path = retry_receipt_dir.clone();
+    //     path.push(hash);
+    //     std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    // }
+    // for (hash, receipt) in retry_fixed_receipts {
+    //     writeln!(
+    //         retry_file,
+    //         "{},{},{},{}.{:07},{}",
+    //         receipt.farm_id,
+    //         receipt.previous_stellar_payout_address,
+    //         receipt.stellar_payout_address,
+    //         receipt.reward.tft / UNITS_PER_TFT,
+    //         receipt.reward.tft % UNITS_PER_TFT,
+    //         receipt.retry_for_receipt,
+    //     )
+    //     .unwrap();
+    //     let mut path = retry_receipt_dir.clone();
+    //     path.push(hash);
+    //     std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    // }
 }
 
 fn block_import<P, E>(
@@ -945,6 +981,7 @@ struct MintingBlock {
     events: Vec<TfchainEvent>,
 }
 
+#[derive(Serialize, Deserialize)]
 enum NodeConnected {
     /// Node was connected in a previous period.
     Old,
@@ -952,6 +989,7 @@ enum NodeConnected {
     Current(i64),
 }
 
+#[derive(Serialize, Deserialize)]
 struct MintingNode {
     id: u32,
     farm_id: u32,
@@ -1257,6 +1295,7 @@ impl MintingNode {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct Contract {
     contract_id: u64,
     node_id: u32,
@@ -1267,7 +1306,7 @@ struct Contract {
     resources: Resources,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct TotalConsumption {
     // cru mru hru sru and ips is value * time i.e. unit seconds
     cru: u128,
