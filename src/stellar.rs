@@ -21,46 +21,39 @@ impl Horizon {
         }
     }
 
-    pub fn filter_previous_mints<V, W>(
+    pub async fn filter_previous_mints<V, W>(
         &self,
         mint_map: &mut HashMap<[u8; 32], V>,
         other_mint_map: &mut HashMap<[u8; 32], W>,
     ) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let mut cursor = "".to_string();
-            loop {
-                let req = api::transactions::for_account(
-                    &PublicKey::from_account_id(TFT_ISSUER).unwrap(),
-                )
-                .with_cursor(&cursor)
-                .with_limit(PAGE_LIMIT)
-                .with_order(&Order::Ascending);
-                let (_, resp) = self.client.request(req).await.unwrap();
-                for tx in &resp.records {
-                    // TODO:
-                    //   - b64 decode memo
-                    //   - remove entry from mint map
-                    if tx.memo_type != "hash" {
-                        continue;
-                    }
-                    // infallible
-                    if let Some(ref memo) = tx.memo {
-                        let mut hash = [0; 32];
-                        base64::decode_config_slice(memo, base64::STANDARD, &mut hash).unwrap();
-                        mint_map.remove(&hash);
-                        other_mint_map.remove(&hash);
-                    }
+        let mut cursor = "".to_string();
+        loop {
+            let req =
+                api::transactions::for_account(&PublicKey::from_account_id(TFT_ISSUER).unwrap())
+                    .with_cursor(&cursor)
+                    .with_limit(PAGE_LIMIT)
+                    .with_order(&Order::Ascending);
+            let (_, resp) = self.client.request(req).await.unwrap();
+            for tx in &resp.records {
+                // TODO:
+                //   - b64 decode memo
+                //   - remove entry from mint map
+                if tx.memo_type != "hash" {
+                    continue;
                 }
-                if resp.records.len() < PAGE_LIMIT as usize {
-                    break;
+                // infallible
+                if let Some(ref memo) = tx.memo {
+                    let mut hash = [0; 32];
+                    base64::decode_config_slice(memo, base64::STANDARD, &mut hash).unwrap();
+                    mint_map.remove(&hash);
+                    other_mint_map.remove(&hash);
                 }
-                // TODO: rework so this clone can go
-                cursor = resp.records[resp.records.len() - 1].paging_token.clone();
             }
-        });
+            if resp.records.len() < PAGE_LIMIT as usize {
+                break;
+            }
+            // TODO: rework so this clone can go
+            cursor = resp.records[resp.records.len() - 1].paging_token.clone();
+        }
     }
 }
