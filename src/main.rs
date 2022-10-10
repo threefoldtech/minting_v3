@@ -71,7 +71,7 @@ fn main() {
     let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
     // Dump state maybe?
-    let stop_block = args.next();
+    let stop_block = args.next().map(|s| s.parse::<u32>().unwrap());
 
     // load previous receipts
     let previous_period_offset = period_offset - 1;
@@ -155,7 +155,11 @@ fn main() {
     println!("Finding start block");
     let start_block = client.height_at_timestamp(start_ts).unwrap();
     println!("Finding end block");
-    let end_block = client.height_at_timestamp(end_ts).unwrap();
+    let mut end_block = client.height_at_timestamp(end_ts).unwrap();
+    if let Some(stop_block) = stop_block {
+        println!("Overriding end block to {}", stop_block);
+        end_block = stop_block;
+    }
 
     // Grab existing nodes
     let mut nodes: BTreeMap<_, _> = Window::at_height(client.clone(), start_block, network)
@@ -261,6 +265,265 @@ fn main() {
         .collect();
     println!("Found {} farming policies", farming_policies.len());
 
+    println!("Setup block import pipeline");
+    let blocks = end_block - start_block + 1;
+    let block_stream = block_import(client.clone(), start_block, end_block, network);
+
+    let bar = ProgressBar::new(blocks as u64);
+    bar.set_style(
+        ProgressStyle::default_bar()
+            .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
+    );
+    let mut last_height = start_block - 1;
+    for block in block_stream {
+        assert_eq!(block.height, last_height + 1);
+
+        for event in block.events {
+            match event {
+                TfchainEvent::TFGrid(grid_event) => match *grid_event {
+                    TFGridEvent::NodeStored(node) => {
+                        nodes.insert(
+                            node.id,
+                            MintingNode {
+                                id: node.id,
+                                farm_id: node.farm_id,
+                                twin_id: node.twin_id,
+                                resources: unsafe { mem::transmute(node.resources) },
+                                location: unsafe { mem::transmute(node.location) },
+                                country: node.country,
+                                city: node.city,
+                                created: node.created,
+                                certification_type: unsafe { mem::transmute(node.certification) },
+                                uptime_info: None,
+                                first_uptime_violation: None,
+                                connected: NodeConnected::Current(block.timestamp.timestamp()),
+                                connection_price: node.connection_price,
+                                capacity_consumption: TotalConsumption::default(),
+                                virtualized: node.virtualized,
+                                farming_policy_id: node.farming_policy_id,
+                            },
+                        );
+                    }
+                    TFGridEvent::NodeUpdated(node) => {
+                        let old_node = nodes
+                            .get_mut(&node.id)
+                            .expect("node update of unknown node");
+                        old_node.farm_id = node.farm_id;
+                        old_node.twin_id = node.twin_id;
+                        // update resources, but only lower them in case of dead or removed
+                        // hardware. Do not update in case of added hardware as this is currently
+                        // unresolved.
+                        old_node.resources.cru =
+                            std::cmp::min(old_node.resources.cru, node.resources.cru);
+                        old_node.resources.mru =
+                            std::cmp::min(old_node.resources.mru, node.resources.mru);
+                        old_node.resources.hru =
+                            std::cmp::min(old_node.resources.hru, node.resources.hru);
+                        old_node.resources.sru =
+                            std::cmp::min(old_node.resources.sru, node.resources.sru);
+                        old_node.location = unsafe { mem::transmute(node.location) };
+                        old_node.resources = unsafe { mem::transmute(node.resources) };
+                        old_node.country = node.country;
+                        old_node.city = node.city;
+                        // Don't care about "create" as that should be fixed anyway
+                        // Update certification type. It's technically possible for a node to jump
+                        // from DIY to certified and back in the same period, but practically that
+                        // should not happen.
+                        old_node.certification_type = unsafe { mem::transmute(node.certification) };
+                        // It is possible that this also causes a node to get a different farming
+                        // policy ID.
+                        old_node.farming_policy_id = node.farming_policy_id;
+                        // Update connection price. This should not happen, but it is here in case
+                        // we modify the connection price of the node in place in the future and
+                        // emit this generic event when the 5 year fixed time is expired.
+                        old_node.connection_price = node.connection_price;
+                        // Even though this likely means the node is rebooted, don't mess with
+                        // uptime_info. The reboot will be detected in the `NodeUptimeReported`
+                        // handler.
+                        // This does not change when the node was connected.
+                        //
+                        // Once a VM, always a VM
+                        if node.virtualized {
+                            old_node.virtualized = node.virtualized;
+                        }
+                    }
+                    TFGridEvent::NodeUptimeReported(id, current_time, reported_uptime) => {
+                        // Sanity check the event, this should not be needed
+                        assert_eq!(current_time as i64, block.timestamp.timestamp());
+                        let node = match nodes.get_mut(&id) {
+                            Some(node) => node,
+                            None => panic!(
+                                "can't report uptime for unknown node {} in block {}",
+                                id, block.height
+                            ),
+                        };
+                        if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
+                            node.uptime_info
+                        {
+                            let report_delta = current_time as i64 - last_reported_at;
+                            let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
+                            // There are quite some situations here. Notice that due to the
+                            // blockchain only producing blocks every 6 seconds, and network delay
+                            // + a host of other issues, we will allow a node to report uptime with
+                            // "grace period" of a couple of minutes or so in either direction.
+                            //
+                            // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
+                            //    rubish.
+                            if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
+                                // This is possible if a node lags when sending uptime (extrinsic
+                                // takes a while to be accepted). Manual data validation found no
+                                // issues (i.e. all incidents of this type were a result of the
+                                // above). This should be changed in the future.
+                                total_uptime += uptime_delta as u64;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                continue;
+                            }
+                            // 2. The difference in uptime is within reason of the difference in
+                            //    report times, i.e. the node is properly reporting.
+                            if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
+                                && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+                            {
+                                // It is technically possible for the delta to be less than 0 and
+                                // within the expected time frame. If nodes boot, send uptime, then
+                                // immediately reboot that is possible. In those cases, handle that
+                                // below, as that is the reboot detection.
+                                if uptime_delta > 0 {
+                                    // Simply add the uptime delta. If this is too large or low by a
+                                    // couple of seconds it will be corrected by the next pings anyhow.
+                                    total_uptime += uptime_delta as u64;
+                                    node.uptime_info =
+                                        Some((current_time as i64, reported_uptime, total_uptime));
+                                    continue;
+                                }
+                            }
+                            // 3. The difference in uptime is too low. Again there are multiple
+                            //    scenarios. Either way we consider the node rebooted. Depending on
+                            //    the reported uptime, the node reports legit uptime, or it reports
+                            //    an uptime which is too high.
+                            //
+                            //    1. Uptime is within bounds.
+                            if reported_uptime as i64 <= report_delta {
+                                total_uptime += reported_uptime;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                continue;
+                            }
+                            //    2. Uptime is higher than previously recorded uptime but too low.
+                            //    This might be a result off network congestion.
+                            if reported_uptime > last_reported_uptime {
+                                total_uptime += uptime_delta as u64;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                continue;
+                            }
+                            //    3. Uptime is too high, this is garbage
+                            if node.first_uptime_violation.is_none() {
+                                node.first_uptime_violation =
+                                    Some((last_reported_at, block.height));
+                            }
+                            continue;
+                        } else {
+                            let period_duration = current_time as i64 - start_ts;
+                            // Make sure we don't give more credit than the current length of the
+                            // period.
+                            let up_in_period =
+                                std::cmp::min(period_duration as u64, reported_uptime);
+                            // Save uptime info
+                            node.uptime_info =
+                                Some((current_time as i64, reported_uptime, up_in_period));
+                        }
+                    }
+                    _ => {}
+                },
+                TfchainEvent::SmartContract(contract_event) => match contract_event {
+                    SmartContractEvent::UpdatedUsedResources(contract_id, resources) => {
+                        let contract = match contracts.get_mut(&contract_id) {
+                            Some(contract) => contract,
+                            // Contract needs to exist.
+                            None => {
+                                panic!("Can't set used resources for contract {} which does not exist in block {}", contract_id, block.height);
+                            }
+                        };
+                        contract.resources = unsafe { mem::transmute(resources) };
+                    }
+                    SmartContractEvent::NruConsumption(contract_id, timestamp, window, nru) => {
+                        let contract = match contracts.get_mut(&contract_id) {
+                            Some(contract) => contract,
+                            // Contract needs to exist.
+                            None => {
+                                panic!("Can't set used resources for contract {} which does not exist in block {}", contract_id, block.height);
+                            }
+                        };
+                        let node = match nodes.get_mut(&contract.node_id) {
+                            Some(node) => node,
+                            None => {
+                                panic!(
+                                    "can't process consumption for unknown node {} in block {}",
+                                    contract.node_id, block.height
+                                )
+                            }
+                        };
+                        // Just to make sure reports are ordered
+                        if timestamp as i64 <= contract.last_report_ts {
+                            // Silently ignore reports out of order, we already covered this in an
+                            // already processed consumption report. This can happen if the node pushes
+                            // a contract consumption report twice.
+                            continue;
+                        }
+
+                        // If report ts predates start we ignore it.
+                        if (timestamp as i64) < start_ts {
+                            continue;
+                        }
+                        node.capacity_consumption.cru += (contract.resources.cru * window) as u128;
+                        node.capacity_consumption.mru += (contract.resources.mru * window) as u128;
+                        node.capacity_consumption.hru += (contract.resources.hru * window) as u128;
+                        node.capacity_consumption.sru += (contract.resources.sru * window) as u128;
+                        node.capacity_consumption.ips += contract.ips as u64 * window;
+                        node.capacity_consumption.nru += nru;
+                        contract.last_report_ts = timestamp as i64;
+                    }
+                    SmartContractEvent::ContractCreated(contract) => {
+                        // we only care about node contracts
+                        if let ContractData::NodeContract(nc) =
+                            unsafe { mem::transmute(contract.contract_type) }
+                        {
+                            contracts.insert(
+                                contract.contract_id,
+                                Contract {
+                                    contract_id: contract.contract_id,
+                                    node_id: nc.node_id,
+                                    last_report_ts: block.timestamp.timestamp(),
+                                    ips: nc.public_ips,
+                                    resources: Resources::default(),
+                                },
+                            );
+                        };
+                    }
+                    SmartContractEvent::NodeContractCanceled(_, _, _) => {
+                        // We can't cancel the contract, as it might still receive a consumption
+                        // report. Technically we should check that only 1 final report is
+                        // received. But honestly it's the chain's job to make sure of that. Now,
+                        // considering IP, we will not do special handling, instead we rely on the
+                        // fact that IP reservations are only credited once a consumption report is
+                        // processed.
+                    }
+                    _ => {}
+                },
+                _ => {}
+            };
+        }
+
+        // update last height for sanity check
+        last_height = block.height;
+        // finally update progress bar
+        bar.set_message(block.timestamp.to_rfc2822());
+        bar.inc(1);
+    }
+
+    bar.finish();
+
     let encoded_nodes = bincode::serialize(&nodes).unwrap();
     let encoded_farms = bincode::serialize(&farms).unwrap();
     let encoded_contracts = bincode::serialize(&contracts).unwrap();
@@ -289,263 +552,6 @@ fn main() {
         .unwrap();
     // DONE here
     return;
-
-    // println!("Setup block import pipeline");
-    // let blocks = end_block - start_block + 1;
-    // let block_stream = block_import(client.clone(), start_block, end_block, network);
-
-    // let bar = ProgressBar::new(blocks as u64);
-    // bar.set_style(
-    //     ProgressStyle::default_bar()
-    //         .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
-    // );
-    // let mut last_height = start_block - 1;
-    // for block in block_stream {
-    //     assert_eq!(block.height, last_height + 1);
-
-    //     for event in block.events {
-    //         match event {
-    //             TfchainEvent::TFGrid(grid_event) => match *grid_event {
-    //                 TFGridEvent::NodeStored(node) => {
-    //                     nodes.insert(
-    //                         node.id,
-    //                         MintingNode {
-    //                             id: node.id,
-    //                             farm_id: node.farm_id,
-    //                             twin_id: node.twin_id,
-    //                             resources: node.resources,
-    //                             location: node.location,
-    //                             country: node.country,
-    //                             city: node.city,
-    //                             created: node.created,
-    //                             certification_type: node.certification,
-    //                             uptime_info: None,
-    //                             first_uptime_violation: None,
-    //                             connected: NodeConnected::Current(block.timestamp.timestamp()),
-    //                             connection_price: node.connection_price,
-    //                             capacity_consumption: TotalConsumption::default(),
-    //                             virtualized: node.virtualized,
-    //                             farming_policy_id: node.farming_policy_id,
-    //                         },
-    //                     );
-    //                 }
-    //                 TFGridEvent::NodeUpdated(node) => {
-    //                     let old_node = nodes
-    //                         .get_mut(&node.id)
-    //                         .expect("node update of unknown node");
-    //                     old_node.farm_id = node.farm_id;
-    //                     old_node.twin_id = node.twin_id;
-    //                     // update resources, but only lower them in case of dead or removed
-    //                     // hardware. Do not update in case of added hardware as this is currently
-    //                     // unresolved.
-    //                     old_node.resources.cru =
-    //                         std::cmp::min(old_node.resources.cru, node.resources.cru);
-    //                     old_node.resources.mru =
-    //                         std::cmp::min(old_node.resources.mru, node.resources.mru);
-    //                     old_node.resources.hru =
-    //                         std::cmp::min(old_node.resources.hru, node.resources.hru);
-    //                     old_node.resources.sru =
-    //                         std::cmp::min(old_node.resources.sru, node.resources.sru);
-    //                     old_node.location = node.location;
-    //                     old_node.resources = node.resources;
-    //                     old_node.country = node.country;
-    //                     old_node.city = node.city;
-    //                     // Don't care about "create" as that should be fixed anyway
-    //                     // Update certification type. It's technically possible for a node to jump
-    //                     // from DIY to certified and back in the same period, but practically that
-    //                     // should not happen.
-    //                     old_node.certification_type = node.certification;
-    //                     // It is possible that this also causes a node to get a different farming
-    //                     // policy ID.
-    //                     old_node.farming_policy_id = node.farming_policy_id;
-    //                     // Update connection price. This should not happen, but it is here in case
-    //                     // we modify the connection price of the node in place in the future and
-    //                     // emit this generic event when the 5 year fixed time is expired.
-    //                     old_node.connection_price = node.connection_price;
-    //                     // Even though this likely means the node is rebooted, don't mess with
-    //                     // uptime_info. The reboot will be detected in the `NodeUptimeReported`
-    //                     // handler.
-    //                     // This does not change when the node was connected.
-    //                     //
-    //                     // Once a VM, always a VM
-    //                     if node.virtualized {
-    //                         old_node.virtualized = node.virtualized;
-    //                     }
-    //                 }
-    //                 TFGridEvent::NodeUptimeReported(id, current_time, reported_uptime) => {
-    //                     // Sanity check the event, this should not be needed
-    //                     assert_eq!(current_time as i64, block.timestamp.timestamp());
-    //                     let node = match nodes.get_mut(&id) {
-    //                         Some(node) => node,
-    //                         None => panic!(
-    //                             "can't report uptime for unknown node {} in block {}",
-    //                             id, block.height
-    //                         ),
-    //                     };
-    //                     if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
-    //                         node.uptime_info
-    //                     {
-    //                         let report_delta = current_time as i64 - last_reported_at;
-    //                         let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
-    //                         // There are quite some situations here. Notice that due to the
-    //                         // blockchain only producing blocks every 6 seconds, and network delay
-    //                         // + a host of other issues, we will allow a node to report uptime with
-    //                         // "grace period" of a couple of minutes or so in either direction.
-    //                         //
-    //                         // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
-    //                         //    rubish.
-    //                         if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-    //                             // This is possible if a node lags when sending uptime (extrinsic
-    //                             // takes a while to be accepted). Manual data validation found no
-    //                             // issues (i.e. all incidents of this type were a result of the
-    //                             // above). This should be changed in the future.
-    //                             total_uptime += uptime_delta as u64;
-    //                             node.uptime_info =
-    //                                 Some((current_time as i64, reported_uptime, total_uptime));
-    //                             continue;
-    //                         }
-    //                         // 2. The difference in uptime is within reason of the difference in
-    //                         //    report times, i.e. the node is properly reporting.
-    //                         if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
-    //                             && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
-    //                         {
-    //                             // It is technically possible for the delta to be less than 0 and
-    //                             // within the expected time frame. If nodes boot, send uptime, then
-    //                             // immediately reboot that is possible. In those cases, handle that
-    //                             // below, as that is the reboot detection.
-    //                             if uptime_delta > 0 {
-    //                                 // Simply add the uptime delta. If this is too large or low by a
-    //                                 // couple of seconds it will be corrected by the next pings anyhow.
-    //                                 total_uptime += uptime_delta as u64;
-    //                                 node.uptime_info =
-    //                                     Some((current_time as i64, reported_uptime, total_uptime));
-    //                                 continue;
-    //                             }
-    //                         }
-    //                         // 3. The difference in uptime is too low. Again there are multiple
-    //                         //    scenarios. Either way we consider the node rebooted. Depending on
-    //                         //    the reported uptime, the node reports legit uptime, or it reports
-    //                         //    an uptime which is too high.
-    //                         //
-    //                         //    1. Uptime is within bounds.
-    //                         if reported_uptime as i64 <= report_delta {
-    //                             total_uptime += reported_uptime;
-    //                             node.uptime_info =
-    //                                 Some((current_time as i64, reported_uptime, total_uptime));
-    //                             continue;
-    //                         }
-    //                         //    2. Uptime is higher than previously recorded uptime but too low.
-    //                         //    This might be a result off network congestion.
-    //                         if reported_uptime > last_reported_uptime {
-    //                             total_uptime += uptime_delta as u64;
-    //                             node.uptime_info =
-    //                                 Some((current_time as i64, reported_uptime, total_uptime));
-    //                             continue;
-    //                         }
-    //                         //    3. Uptime is too high, this is garbage
-    //                         if node.first_uptime_violation.is_none() {
-    //                             node.first_uptime_violation =
-    //                                 Some((last_reported_at, block.height));
-    //                         }
-    //                         continue;
-    //                     } else {
-    //                         let period_duration = current_time as i64 - start_ts;
-    //                         // Make sure we don't give more credit than the current length of the
-    //                         // period.
-    //                         let up_in_period =
-    //                             std::cmp::min(period_duration as u64, reported_uptime);
-    //                         // Save uptime info
-    //                         node.uptime_info =
-    //                             Some((current_time as i64, reported_uptime, up_in_period));
-    //                     }
-    //                 }
-    //                 _ => {}
-    //             },
-    //             TfchainEvent::SmartContract(contract_event) => match contract_event {
-    //                 SmartContractEvent::UpdatedUsedResources(contract_id, resources) => {
-    //                     let contract = match contracts.get_mut(&contract_id) {
-    //                         Some(contract) => contract,
-    //                         // Contract needs to exist.
-    //                         None => {
-    //                             panic!("Can't set used resources for contract {} which does not exist in block {}", contract_id, block.height);
-    //                         }
-    //                     };
-    //                     contract.resources = resources;
-    //                 }
-    //                 SmartContractEvent::NruConsumption(contract_id, timestamp, window, nru) => {
-    //                     let contract = match contracts.get_mut(&contract_id) {
-    //                         Some(contract) => contract,
-    //                         // Contract needs to exist.
-    //                         None => {
-    //                             panic!("Can't set used resources for contract {} which does not exist in block {}", contract_id, block.height);
-    //                         }
-    //                     };
-    //                     let node = match nodes.get_mut(&contract.node_id) {
-    //                         Some(node) => node,
-    //                         None => {
-    //                             panic!(
-    //                                 "can't process consumption for unknown node {} in block {}",
-    //                                 contract.node_id, block.height
-    //                             )
-    //                         }
-    //                     };
-    //                     // Just to make sure reports are ordered
-    //                     if timestamp as i64 <= contract.last_report_ts {
-    //                         // Silently ignore reports out of order, we already covered this in an
-    //                         // already processed consumption report. This can happen if the node pushes
-    //                         // a contract consumption report twice.
-    //                         continue;
-    //                     }
-
-    //                     // If report ts predates start we ignore it.
-    //                     if (timestamp as i64) < start_ts {
-    //                         continue;
-    //                     }
-    //                     node.capacity_consumption.cru += (contract.resources.cru * window) as u128;
-    //                     node.capacity_consumption.mru += (contract.resources.mru * window) as u128;
-    //                     node.capacity_consumption.hru += (contract.resources.hru * window) as u128;
-    //                     node.capacity_consumption.sru += (contract.resources.sru * window) as u128;
-    //                     node.capacity_consumption.ips += contract.ips as u64 * window;
-    //                     node.capacity_consumption.nru += nru;
-    //                     contract.last_report_ts = timestamp as i64;
-    //                 }
-    //                 SmartContractEvent::ContractCreated(contract) => {
-    //                     // we only care about node contracts
-    //                     if let ContractData::NodeContract(nc) = contract.contract_type {
-    //                         contracts.insert(
-    //                             contract.contract_id,
-    //                             Contract {
-    //                                 contract_id: contract.contract_id,
-    //                                 node_id: nc.node_id,
-    //                                 last_report_ts: block.timestamp.timestamp(),
-    //                                 ips: nc.public_ips,
-    //                                 resources: Resources::default(),
-    //                             },
-    //                         );
-    //                     };
-    //                 }
-    //                 SmartContractEvent::NodeContractCanceled(_, _, _) => {
-    //                     // We can't cancel the contract, as it might still receive a consumption
-    //                     // report. Technically we should check that only 1 final report is
-    //                     // received. But honestly it's the chain's job to make sure of that. Now,
-    //                     // considering IP, we will not do special handling, instead we rely on the
-    //                     // fact that IP reservations are only credited once a consumption report is
-    //                     // processed.
-    //                 }
-    //                 _ => {}
-    //             },
-    //             _ => {}
-    //         };
-    //     }
-
-    //     // update last height for sanity check
-    //     last_height = block.height;
-    //     // finally update progress bar
-    //     bar.set_message(block.timestamp.to_rfc2822());
-    //     bar.inc(1);
-    // }
-
-    // bar.finish();
 
     // println!("Getting uptime info from post period");
     // let block_stream = block_import(client, end_block, end_block + BLOCKS_IN_HOUR * 2, network);
