@@ -9,7 +9,7 @@ vendored = ["openssl"]
 
 [dependencies]
 #tfchain_client = { git = "https://github.com/threefoldtech/tfchain_client", branch = "main" }
-tfchain_client = { git = "https://github.com/threefoldtech/tfchain_client", branch = "new_client" }
+tfchain_client = { git = "https://github.com/threefoldtech/tfchain_client", rev = "71977d1" }
 #tfchain_client = { path = "../tfchain_client" }
 indicatif = "0.16"
 sp-core = "6.0.0"

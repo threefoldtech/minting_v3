@@ -6,20 +6,23 @@ use receipt::{
     CloudUnits, FixupReceipt, MintingReceipt, ResourceRewards, ResourceUnits, ResourceUtilization,
     RetryPayoutReceipt, Reward,
 };
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
-    io::{Read, Write},
+    io::Write,
     mem,
     os::unix::prelude::OsStrExt,
     path,
-    sync::mpsc,
 };
-use tfchain_client::testnet;
-use types::{
-    BlockNumber, ContractData, Farm, FarmingPolicy, Location, NodeCertification, Resources,
+use tfchain_client::runtimes::v115::{client::Client, runtime};
+use tfchain_client::{
+    client::{height_at_timestamp, RuntimeClient},
+    types::{
+        Contract as ChainContract, ContractData, ContractResources, Farm, FarmPolicy, Location,
+        Node, NodeCertification, Resources,
+    },
 };
+use types::BlockNumber;
 
 mod period;
 mod receipt;
@@ -77,7 +80,6 @@ async fn main() {
     let start_ts: i64 = period.start();
     let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
-    let start_block = args.next().unwrap().parse::<u32>().unwrap();
 
     // load previous receipts
     let previous_period_offset = period_offset - 1;
@@ -155,14 +157,12 @@ async fn main() {
         );
     }
 
-    let client = tfchain_client::Client::new(&wss_url, tfchain_client::Runtime::Testnet)
-        .await
-        .unwrap();
+    let client = Client::new(&wss_url).await.unwrap();
 
     println!("Finding start block");
-    //let start_block = client.height_at_timestamp(start_ts).await.unwrap();
+    let start_block = height_at_timestamp(&client, start_ts).await.unwrap();
     println!("Finding end block");
-    let end_block = client.height_at_timestamp(end_ts).await.unwrap();
+    let end_block = height_at_timestamp(&client, end_ts).await.unwrap();
 
     // Grab existing nodes
     // let mut nodes: BTreeMap<_, _> = Window::at_height(client.clone(), start_block, network)
@@ -196,7 +196,35 @@ async fn main() {
     //         )
     //     })
     //     .collect();
-    // println!("Found {} existing nodes", nodes.len());
+    let mut nodes: BTreeMap<_, _> = get_nodes(&client, start_block)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|node| {
+            (
+                node.id,
+                MintingNode {
+                    id: node.id,
+                    farm_id: node.farm_id,
+                    twin_id: node.twin_id,
+                    resources: unsafe { mem::transmute(node.resources) },
+                    location: unsafe { mem::transmute(node.location) },
+                    country: node.country,
+                    city: node.city,
+                    created: node.created,
+                    certification_type: unsafe { mem::transmute(node.certification) },
+                    uptime_info: None,
+                    first_uptime_violation: None,
+                    connected: NodeConnected::Old,
+                    connection_price: node.connection_price,
+                    capacity_consumption: TotalConsumption::default(),
+                    virtualized: node.virtualized,
+                    farming_policy_id: node.farming_policy_id,
+                },
+            )
+        })
+        .collect();
+    println!("Found {} existing nodes", nodes.len());
 
     // // Load farms at the end of the period. This means we don't have to parse individual farm
     // // events, as we can just fetch the last known state.
@@ -213,6 +241,13 @@ async fn main() {
     //         (farm.id, farm)
     //     })
     //     .collect();
+    let farms: BTreeMap<_, _> = get_farms(&client, end_block)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|farm| (farm.id, farm))
+        .collect();
+    println!("Found {} existing farms", farms.len());
 
     // let payout_addresses: BTreeMap<_, _> = farms
     //     .iter()
@@ -222,7 +257,9 @@ async fn main() {
     //         None => None,
     //     })
     //     .collect();
-
+    let payout_addresses: BTreeMap<_, _> = get_payout_addresses(&client, &farms, end_block)
+        .await
+        .unwrap();
     // // Grab existing contracts
     // let mut contracts: BTreeMap<_, _> = Window::at_height(client.clone(), start_block, network)
     //     .unwrap()
@@ -252,7 +289,32 @@ async fn main() {
     //         }
     //     })
     //     .collect();
-    // println!("Found {} existing contracts", contracts.len());
+    let mut contracts: BTreeMap<_, _> = get_contracts(&client, start_block)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(contract, resources)| {
+            // Namecontract is actually billed once deployed through a node contract.
+            if let ContractData::NodeContract(nc) =
+                unsafe { mem::transmute(contract.contract_type) }
+            {
+                Some((
+                    contract.contract_id,
+                    Contract {
+                        contract_id: contract.contract_id,
+                        node_id: nc.node_id,
+                        // a report should pop up for this
+                        last_report_ts: 0,
+                        ips: nc.public_ips,
+                        resources,
+                    },
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    println!("Found {} existing contracts", contracts.len());
 
     // // Get farming policies
     // let farming_policies: BTreeMap<_, _> = Window::at_height(client.clone(), end_block, network)
@@ -266,43 +328,13 @@ async fn main() {
     //         Some((policy.id, policy))
     //     })
     //     .collect();
-    // println!("Found {} farming policies", farming_policies.len());
-
-    let mut encoded_nodes = Vec::new();
-    std::fs::File::open("nodes.bin")
+    let farming_policies: BTreeMap<_, _> = get_farming_policies(&client, end_block)
+        .await
         .unwrap()
-        .read_to_end(&mut encoded_nodes)
-        .unwrap();
-    let mut encoded_farms = Vec::new();
-    std::fs::File::open("farms.bin")
-        .unwrap()
-        .read_to_end(&mut encoded_farms)
-        .unwrap();
-    let mut encoded_payout_addresses = Vec::new();
-    std::fs::File::open("payout_addresses.bin")
-        .unwrap()
-        .read_to_end(&mut encoded_payout_addresses)
-        .unwrap();
-    let mut encoded_contracts = Vec::new();
-    std::fs::File::open("contracts.bin")
-        .unwrap()
-        .read_to_end(&mut encoded_contracts)
-        .unwrap();
-    let mut encoded_farming_policies = Vec::new();
-    std::fs::File::open("farming_policies.bin")
-        .unwrap()
-        .read_to_end(&mut encoded_farming_policies)
-        .unwrap();
-
-    let mut nodes: BTreeMap<u32, MintingNode> = bincode::deserialize(&encoded_nodes).unwrap();
-    let mut farms: BTreeMap<u32, types::Farm> = bincode::deserialize(&encoded_farms).unwrap();
-    let mut payout_addresses: BTreeMap<u32, String> =
-        bincode::deserialize(&encoded_payout_addresses).unwrap();
-    let mut contracts: BTreeMap<u64, Contract> = bincode::deserialize(&encoded_contracts).unwrap();
-    let mut farming_policies: BTreeMap<u32, types::FarmingPolicy<u32>> =
-        bincode::deserialize(&encoded_farming_policies).unwrap();
-
-    println!("Found {} contracts", contracts.len());
+        .into_iter()
+        .filter_map(|policy| Some((policy.id, policy)))
+        .collect();
+    println!("Found {} farming policies", farming_policies.len());
 
     println!("Setup block import pipeline");
     let blocks = end_block - start_block + 1;
@@ -317,14 +349,15 @@ async fn main() {
     let mut last_height = start_block - 1;
     let mut height = start_block;
     loop {
-        let evts = client.get_events(Some(height)).await.unwrap();
-        let ts = client.block_timestamp(Some(height)).await.unwrap() / 1000;
+        let hash = client.hash_at_height(Some(height)).await.unwrap();
+        let evts = client.events(hash).await.unwrap();
+        let ts = client.timestamp(hash).await.unwrap() / 1000;
         for evt in evts.iter() {
             let evt = evt.unwrap();
             match (evt.pallet_name(), evt.variant_name()) {
                 (TFGRID_MODULE, NODE_STORED) => {
                     let node = evt
-                        .as_event::<testnet::api::tfgrid_module::events::NodeStored>()
+                        .as_event::<runtime::api::tfgrid_module::events::NodeStored>()
                         .unwrap()
                         .unwrap()
                         .0;
@@ -352,7 +385,7 @@ async fn main() {
                 }
                 (TFGRID_MODULE, NODE_UPDATED) => {
                     let node = evt
-                        .as_event::<testnet::api::tfgrid_module::events::NodeUpdated>()
+                        .as_event::<runtime::api::tfgrid_module::events::NodeUpdated>()
                         .unwrap()
                         .unwrap()
                         .0;
@@ -401,7 +434,7 @@ async fn main() {
                 }
                 (TFGRID_MODULE, NODE_UPTIME_REPORTED) => {
                     let data = evt
-                        .as_event::<testnet::api::tfgrid_module::events::NodeUptimeReported>()
+                        .as_event::<runtime::api::tfgrid_module::events::NodeUptimeReported>()
                         .unwrap()
                         .unwrap();
                     let (id, current_time, reported_uptime) = (data.0, data.1, data.2);
@@ -490,7 +523,7 @@ async fn main() {
                 }
                 (SMART_CONTRACT_MODULE, UPDATE_USED_RESOURCES) => {
                     let data = evt
-                        .as_event::<testnet::api::smart_contract_module::events::UpdatedUsedResources>()
+                        .as_event::<runtime::api::smart_contract_module::events::UpdatedUsedResources>()
                         .unwrap()
                         .unwrap().0;
                     let contract = match contracts.get_mut(&data.contract_id) {
@@ -504,7 +537,7 @@ async fn main() {
                 }
                 (SMART_CONTRACT_MODULE, NRU_CONSUMPTION_RECEIVED) => {
                     let data = evt
-                        .as_event::<testnet::api::smart_contract_module::events::NruConsumptionReportReceived>()
+                        .as_event::<runtime::api::smart_contract_module::events::NruConsumptionReportReceived>()
                         .unwrap()
                         .unwrap().0;
                     let contract = match contracts.get_mut(&data.contract_id) {
@@ -551,11 +584,11 @@ async fn main() {
                 }
                 (SMART_CONTRACT_MODULE, CONTRACT_CREATED) => {
                     let contract = evt
-                        .as_event::<testnet::api::smart_contract_module::events::ContractCreated>()
+                        .as_event::<runtime::api::smart_contract_module::events::ContractCreated>()
                         .unwrap()
                         .unwrap()
                         .0;
-                    if let testnet::api::runtime_types::pallet_smart_contract::types::ContractData::NodeContract(nc) = contract.contract_type {
+                    if let runtime::api::runtime_types::pallet_smart_contract::types::ContractData::NodeContract(nc) = contract.contract_type {
                         contracts.insert(
                             contract.contract_id,
                             Contract {
@@ -563,7 +596,12 @@ async fn main() {
                                 node_id: nc.node_id,
                                 last_report_ts: ts,
                                 ips: nc.public_ips,
-                                resources: Resources::default(),
+                                resources: Resources {
+                                    hru: 0,
+                                    sru: 0,
+                                    cru: 0,
+                                    mru: 0,
+                                },
                             },
                         );
                     };
@@ -604,14 +642,15 @@ async fn main() {
     // Collect post-period uptime events. Violations don't matter here, those will be handled next
     // period.
     loop {
-        let evts = client.get_events(Some(height)).await.unwrap();
-        let ts = client.block_timestamp(Some(height)).await.unwrap() / 1000;
+        let hash = client.hash_at_height(Some(height)).await.unwrap();
+        let evts = client.events(hash).await.unwrap();
+        let ts = client.timestamp(hash).await.unwrap() / 1000;
         for evt in evts.iter() {
             let evt = evt.unwrap();
             match (evt.pallet_name(), evt.variant_name()) {
                 (TFGRID_MODULE, NODE_UPTIME_REPORTED) => {
                     let data = evt
-                        .as_event::<testnet::api::tfgrid_module::events::NodeUptimeReported>()
+                        .as_event::<runtime::api::tfgrid_module::events::NodeUptimeReported>()
                         .unwrap()
                         .unwrap();
                     let (id, current_time, reported_uptime) = (data.0, data.1, data.2);
@@ -1041,10 +1080,9 @@ async fn main() {
 struct MintingBlock {
     height: BlockNumber,
     timestamp: DateTime<Utc>,
-    events: Vec<tfchain_client::Events<tfchain_client::PolkadotConfig>>,
+    events: Vec<tfchain_client::client::Events<tfchain_client::client::PolkadotConfig>>,
 }
 
-#[derive(Serialize, Deserialize)]
 enum NodeConnected {
     /// Node was connected in a previous period.
     Old,
@@ -1052,7 +1090,6 @@ enum NodeConnected {
     Current(i64),
 }
 
-#[derive(Serialize, Deserialize)]
 struct MintingNode {
     id: u32,
     farm_id: u32,
@@ -1123,10 +1160,7 @@ impl MintingNode {
     /// Additionally, "certified" nodes get 25% extra.
     ///
     /// A virtualized node (i.e. zos running in VM) won't get anything.
-    fn node_payout_musd(
-        &self,
-        farming_policies: &BTreeMap<u32, FarmingPolicy<BlockNumber>>,
-    ) -> u64 {
+    fn node_payout_musd(&self, farming_policies: &BTreeMap<u32, FarmPolicy>) -> u64 {
         if self.virtualized || self.first_uptime_violation.is_some() {
             return 0;
         }
@@ -1152,10 +1186,7 @@ impl MintingNode {
     /// Calculate the TFT payout of the node in the minting period based on its cloud units and
     /// connection price. The payout is expressed in "units", where 1 TFT == 10_000_000 units.
     /// This also acconts for measured NU and Ip usage.
-    fn node_payout_tft_units(
-        &self,
-        farming_policies: &BTreeMap<u32, FarmingPolicy<BlockNumber>>,
-    ) -> u64 {
+    fn node_payout_tft_units(&self, farming_policies: &BTreeMap<u32, FarmPolicy>) -> u64 {
         // connection price is in mUSD.
         // TODO: revert once fixed on chain (presumably period 54)
         // self.node_payout_musd(farming_policies) * UNITS_PER_TFT / self.connection_price as u64
@@ -1200,7 +1231,7 @@ impl MintingNode {
         period: Period,
         farms: &BTreeMap<u32, Farm>,
         payout_addresses: &BTreeMap<u32, String>,
-        farming_policies: &BTreeMap<u32, FarmingPolicy<BlockNumber>>,
+        farming_policies: &BTreeMap<u32, FarmPolicy>,
     ) -> MintingReceipt {
         let uptime = if let Some((_, _, uptime)) = self.uptime_info {
             uptime
@@ -1308,7 +1339,7 @@ impl MintingNode {
     fn scaled_payout(
         &self,
         period: Period,
-        farming_policies: &BTreeMap<u32, FarmingPolicy<BlockNumber>>,
+        farming_policies: &BTreeMap<u32, FarmPolicy>,
     ) -> (u64, u64) {
         if let Some((_, _, uptime)) = self.uptime_info {
             // Calculate uptime with 0.001% precision by upscaling with factor 1_000.
@@ -1358,7 +1389,6 @@ impl MintingNode {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 struct Contract {
     contract_id: u64,
     node_id: u32,
@@ -1369,7 +1399,7 @@ struct Contract {
     resources: Resources,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default)]
 struct TotalConsumption {
     // cru mru hru sru and ips is value * time i.e. unit seconds
     cru: u128,
@@ -1378,4 +1408,94 @@ struct TotalConsumption {
     mru: u128,
     ips: u64,
     nru: u64,
+}
+
+pub async fn get_nodes(
+    client: &dyn RuntimeClient,
+    block: u32,
+) -> Result<Vec<Node>, Box<dyn std::error::Error>> {
+    let hash = client.hash_at_height(Some(block)).await?;
+    let node_count = client.node_count(hash).await?;
+    let mut nodes = Vec::new();
+    for i in 1..=node_count {
+        if let Some(node) = client.node(i, hash).await? {
+            nodes.push(node);
+        }
+    }
+    Ok(nodes)
+}
+
+pub async fn get_farms(
+    client: &dyn RuntimeClient,
+    block: u32,
+) -> Result<Vec<Farm>, Box<dyn std::error::Error>> {
+    let hash = client.hash_at_height(Some(block)).await?;
+    let farm_count = client.farm_count(hash).await?;
+    let mut farms = Vec::new();
+    for i in 1..=farm_count {
+        if let Some(farm) = client.farm(i, hash).await? {
+            farms.push(farm);
+        }
+    }
+    Ok(farms)
+}
+
+pub async fn get_payout_addresses(
+    client: &dyn RuntimeClient,
+    farms: &BTreeMap<u32, Farm>,
+    block: u32,
+) -> Result<BTreeMap<u32, String>, Box<dyn std::error::Error>> {
+    let hash = client.hash_at_height(Some(block)).await?;
+    let mut addresses = BTreeMap::new();
+    for (&id, _) in farms {
+        match client.farm_payout_address(id, hash).await? {
+            Some(a) => {
+                addresses.insert(id, a);
+            }
+            None => continue,
+        }
+    }
+    Ok(addresses)
+}
+
+pub async fn get_contracts(
+    client: &dyn RuntimeClient,
+    block: u32,
+) -> Result<Vec<(ChainContract, Resources)>, Box<dyn std::error::Error>> {
+    let hash = client.hash_at_height(Some(block)).await?;
+    let contract_count = client.contract_count(hash).await?;
+    let mut contracts = Vec::new();
+    for i in 1..=contract_count {
+        if let Some(contract) = client.contract(i, hash).await? {
+            if let Some(contract_resources) = client.contract_resources(i, hash).await? {
+                contracts.push((contract, contract_resources.used));
+            } else {
+                contracts.push((
+                    contract,
+                    Resources {
+                        hru: 0,
+                        sru: 0,
+                        cru: 0,
+                        mru: 0,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(contracts)
+}
+
+pub async fn get_farming_policies(
+    client: &dyn RuntimeClient,
+    block: u32,
+) -> Result<Vec<FarmPolicy>, Box<dyn std::error::Error>> {
+    let hash = client.hash_at_height(Some(block)).await?;
+    let policy_count = client.farming_policy_count(hash).await?;
+    let mut policies = Vec::new();
+    for i in 1..=policy_count {
+        if let Some(farm_policy) = client.farming_policy(i, hash).await? {
+            policies.push(farm_policy);
+        }
+    }
+    Ok(policies)
 }
