@@ -165,37 +165,6 @@ async fn main() {
     let end_block = height_at_timestamp(&client, end_ts).await.unwrap();
 
     // Grab existing nodes
-    // let mut nodes: BTreeMap<_, _> = Window::at_height(client.clone(), start_block, network)
-    //     .unwrap()
-    //     .unwrap()
-    //     .nodes()
-    //     .unwrap()
-    //     .into_iter()
-    //     .map(|node| {
-    //         let node = node.unwrap();
-    //         (
-    //             node.id,
-    //             MintingNode {
-    //                 id: node.id,
-    //                 farm_id: node.farm_id,
-    //                 twin_id: node.twin_id,
-    //                 resources: unsafe { mem::transmute(node.resources) },
-    //                 location: unsafe { mem::transmute(node.location) },
-    //                 country: node.country,
-    //                 city: node.city,
-    //                 created: node.created,
-    //                 certification_type: unsafe { mem::transmute(node.certification) },
-    //                 uptime_info: None,
-    //                 first_uptime_violation: None,
-    //                 connected: NodeConnected::Old,
-    //                 connection_price: node.connection_price,
-    //                 capacity_consumption: TotalConsumption::default(),
-    //                 virtualized: node.virtualized,
-    //                 farming_policy_id: node.farming_policy_id,
-    //             },
-    //         )
-    //     })
-    //     .collect();
     let mut nodes: BTreeMap<_, _> = get_nodes(&client, start_block)
         .await
         .unwrap()
@@ -207,12 +176,12 @@ async fn main() {
                     id: node.id,
                     farm_id: node.farm_id,
                     twin_id: node.twin_id,
-                    resources: unsafe { mem::transmute(node.resources) },
-                    location: unsafe { mem::transmute(node.location) },
+                    resources: node.resources,
+                    location: node.location,
                     country: node.country,
                     city: node.city,
                     created: node.created,
-                    certification_type: unsafe { mem::transmute(node.certification) },
+                    certification_type: node.certification,
                     uptime_info: None,
                     first_uptime_violation: None,
                     connected: NodeConnected::Old,
@@ -226,21 +195,8 @@ async fn main() {
         .collect();
     println!("Found {} existing nodes", nodes.len());
 
-    // // Load farms at the end of the period. This means we don't have to parse individual farm
-    // // events, as we can just fetch the last known state.
-    // let farm_window = Window::at_height(client.clone(), end_block, network)
-    //     .unwrap()
-    //     .unwrap();
-
-    // let farms: BTreeMap<_, _> = farm_window
-    //     .farms()
-    //     .unwrap()
-    //     .into_iter()
-    //     .map(|farm| {
-    //         let farm = farm.unwrap();
-    //         (farm.id, farm)
-    //     })
-    //     .collect();
+    // Load farms at the end of the period. This means we don't have to parse individual farm
+    // events, as we can just fetch the last known state.
     let farms: BTreeMap<_, _> = get_farms(&client, end_block)
         .await
         .unwrap()
@@ -249,46 +205,10 @@ async fn main() {
         .collect();
     println!("Found {} existing farms", farms.len());
 
-    // let payout_addresses: BTreeMap<_, _> = farms
-    //     .iter()
-    //     .map(|(id, _)| (id, farm_window.farm_payout_address(*id).unwrap()))
-    //     .filter_map(|(id, address)| match address {
-    //         Some(address) => Some((*id, address)),
-    //         None => None,
-    //     })
-    //     .collect();
     let payout_addresses: BTreeMap<_, _> = get_payout_addresses(&client, &farms, end_block)
         .await
         .unwrap();
-    // // Grab existing contracts
-    // let mut contracts: BTreeMap<_, _> = Window::at_height(client.clone(), start_block, network)
-    //     .unwrap()
-    //     .unwrap()
-    //     .contracts(false)
-    //     .unwrap()
-    //     .into_iter()
-    //     .filter_map(|contract| {
-    //         let (contract, resources) = contract.unwrap();
-    //         // Namecontract is actually billed once deployed through a node contract.
-    //         if let ContractData::NodeContract(nc) =
-    //             unsafe { mem::transmute(contract.contract_type) }
-    //         {
-    //             Some((
-    //                 contract.contract_id,
-    //                 Contract {
-    //                     contract_id: contract.contract_id,
-    //                     node_id: nc.node_id,
-    //                     // a report should pop up for this
-    //                     last_report_ts: 0,
-    //                     ips: nc.public_ips,
-    //                     resources: unsafe { mem::transmute(resources) },
-    //                 },
-    //             ))
-    //         } else {
-    //             None
-    //         }
-    //     })
-    //     .collect();
+    // Grab existing contracts
     let mut contracts: BTreeMap<_, _> = get_contracts(&client, start_block)
         .await
         .unwrap()
@@ -316,18 +236,7 @@ async fn main() {
         .collect();
     println!("Found {} existing contracts", contracts.len());
 
-    // // Get farming policies
-    // let farming_policies: BTreeMap<_, _> = Window::at_height(client.clone(), end_block, network)
-    //     .unwrap()
-    //     .unwrap()
-    //     .farm_policies()
-    //     .unwrap()
-    //     .into_iter()
-    //     .filter_map(|policy| {
-    //         let policy = policy.unwrap();
-    //         Some((policy.id, policy))
-    //     })
-    //     .collect();
+    // Get farming policies
     let farming_policies: BTreeMap<_, _> = get_farming_policies(&client, end_block)
         .await
         .unwrap()
@@ -372,7 +281,10 @@ async fn main() {
                             country: unsafe { mem::transmute(node.country) },
                             city: unsafe { mem::transmute(node.city) },
                             created: node.created,
-                            certification_type: unsafe { mem::transmute(node.certification) },
+                            certification_type: match node.certification {
+                                tfchain_client::runtimes::v115::runtime::api::runtime_types::tfchain_support::types::NodeCertification::Diy => NodeCertification::Diy,
+                                tfchain_client::runtimes::v115::runtime::api::runtime_types::tfchain_support::types::NodeCertification::Certified => NodeCertification::Certified,
+                            },
                             uptime_info: None,
                             first_uptime_violation: None,
                             connected: NodeConnected::Current(ts),
@@ -414,7 +326,10 @@ async fn main() {
                     // Update certification type. It's technically possible for a node to jump
                     // from DIY to certified and back in the same period, but practically that
                     // should not happen.
-                    old_node.certification_type = unsafe { mem::transmute(node.certification) };
+                    old_node.certification_type = match node.certification {
+                                tfchain_client::runtimes::v115::runtime::api::runtime_types::tfchain_support::types::NodeCertification::Diy => NodeCertification::Diy,
+                                tfchain_client::runtimes::v115::runtime::api::runtime_types::tfchain_support::types::NodeCertification::Certified => NodeCertification::Certified,
+                    };
                     // It is possible that this also causes a node to get a different farming
                     // policy ID.
                     old_node.farming_policy_id = node.farming_policy_id;
