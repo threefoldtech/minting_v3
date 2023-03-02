@@ -206,9 +206,7 @@ async fn main() {
         .into_iter()
         .filter_map(|(contract, resources)| {
             // Namecontract is actually billed once deployed through a node contract.
-            if let ContractData::NodeContract(nc) =
-                unsafe { mem::transmute(contract.contract_type) }
-            {
+            if let ContractData::NodeContract(nc) = contract.contract_type {
                 Some((
                     contract.contract_id,
                     Contract {
@@ -251,7 +249,7 @@ async fn main() {
         let hash = client.hash_at_height(Some(height)).await.unwrap();
         let evts = client.events(hash).await.unwrap();
         let ts = client.timestamp(hash).await.unwrap() / 1000;
-        for evt in evts.iter() {
+        for evt in evts.into_iter() {
             match evt {
                 RuntimeEvents::NodeStoredEvent(node) => {
                     nodes.insert(
@@ -260,10 +258,10 @@ async fn main() {
                             id: node.id,
                             farm_id: node.farm_id,
                             twin_id: node.twin_id,
-                            resources: unsafe { mem::transmute(node.resources.clone()) },
-                            location: unsafe { mem::transmute(node.location.clone()) },
-                            country: unsafe { mem::transmute(node.country.clone()) },
-                            city: unsafe { mem::transmute(node.city.clone()) },
+                            resources: node.resources,
+                            location: node.location,
+                            country: node.country,
+                            city: node.city,
                             created: node.created,
                             certification_type: node.certification.clone(),
                             uptime_info: None,
@@ -293,10 +291,10 @@ async fn main() {
                         std::cmp::min(old_node.resources.hru, node.resources.hru);
                     old_node.resources.sru =
                         std::cmp::min(old_node.resources.sru, node.resources.sru);
-                    old_node.location = unsafe { mem::transmute(node.location.clone()) };
-                    old_node.resources = unsafe { mem::transmute(node.resources.clone()) };
-                    old_node.country = unsafe { mem::transmute(node.country.clone()) };
-                    old_node.city = unsafe { mem::transmute(node.city.clone()) };
+                    old_node.location = node.location;
+                    old_node.resources = node.resources;
+                    old_node.country = node.country;
+                    old_node.city = node.city;
                     // Don't care about "create" as that should be fixed anyway
                     // Update certification type. It's technically possible for a node to jump
                     // from DIY to certified and back in the same period, but practically that
@@ -330,8 +328,8 @@ async fn main() {
                     if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
                         node.uptime_info
                     {
-                        let report_delta = *current_time as i64 - last_reported_at;
-                        let uptime_delta = *reported_uptime as i64 - last_reported_uptime as i64;
+                        let report_delta = current_time as i64 - last_reported_at;
+                        let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
                         // There are quite some situations here. Notice that due to the
                         // blockchain only producing blocks every 6 seconds, and network delay
                         // + a host of other issues, we will allow a node to report uptime with
@@ -346,7 +344,7 @@ async fn main() {
                             // above). This should be changed in the future.
                             total_uptime += uptime_delta as u64;
                             node.uptime_info =
-                                Some((*current_time as i64, *reported_uptime, total_uptime));
+                                Some((current_time as i64, reported_uptime, total_uptime));
                             continue;
                         }
                         // 2. The difference in uptime is within reason of the difference in
@@ -363,7 +361,7 @@ async fn main() {
                                 // couple of seconds it will be corrected by the next pings anyhow.
                                 total_uptime += uptime_delta as u64;
                                 node.uptime_info =
-                                    Some((*current_time as i64, *reported_uptime, total_uptime));
+                                    Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
                             }
                         }
@@ -373,18 +371,18 @@ async fn main() {
                         //    an uptime which is too high.
                         //
                         //    1. Uptime is within bounds.
-                        if *reported_uptime as i64 <= report_delta {
-                            total_uptime += *reported_uptime;
+                        if reported_uptime as i64 <= report_delta {
+                            total_uptime += reported_uptime;
                             node.uptime_info =
-                                Some((*current_time as i64, *reported_uptime, total_uptime));
+                                Some((current_time as i64, reported_uptime, total_uptime));
                             continue;
                         }
                         //    2. Uptime is higher than previously recorded uptime but too low.
                         //    This might be a result off network congestion.
-                        if *reported_uptime > last_reported_uptime {
+                        if reported_uptime > last_reported_uptime {
                             total_uptime += uptime_delta as u64;
                             node.uptime_info =
-                                Some((*current_time as i64, *reported_uptime, total_uptime));
+                                Some((current_time as i64, reported_uptime, total_uptime));
                             continue;
                         }
                         //    3. Uptime is too high, this is garbage
@@ -393,13 +391,13 @@ async fn main() {
                         }
                         continue;
                     } else {
-                        let period_duration = *current_time as i64 - start_ts;
+                        let period_duration = current_time as i64 - start_ts;
                         // Make sure we don't give more credit than the current length of the
                         // period.
-                        let up_in_period = std::cmp::min(period_duration as u64, *reported_uptime);
+                        let up_in_period = std::cmp::min(period_duration as u64, reported_uptime);
                         // Save uptime info
                         node.uptime_info =
-                            Some((*current_time as i64, *reported_uptime, up_in_period));
+                            Some((current_time as i64, reported_uptime, up_in_period));
                     }
                 }
                 RuntimeEvents::ContractUsedResourcesUpdated(data) => {
@@ -410,7 +408,7 @@ async fn main() {
                             panic!("Can't set used resources for contract {} which does not exist in block {}", data.contract_id, height);
                         }
                     };
-                    contract.resources = unsafe { mem::transmute(data.used.clone()) };
+                    contract.resources = data.used;
                 }
                 RuntimeEvents::NruConsumptionReceived(data) => {
                     let contract = match contracts.get_mut(&data.contract_id) {
