@@ -14,12 +14,13 @@ use std::{
     os::unix::prelude::OsStrExt,
     path,
 };
-use tfchain_client::runtimes::v115::{client::Client, runtime};
+use tfchain_client::dynamic::DynamicClient;
+// use tfchain_client::runtimes::v115::{client::Client, runtime};
 use tfchain_client::{
     client::{height_at_timestamp, RuntimeClient},
     types::{
         Contract as ChainContract, ContractData, ContractResources, Farm, FarmPolicy, Location,
-        Node, NodeCertification, Resources,
+        Node, NodeCertification, Resources, RuntimeEvents,
     },
 };
 use types::BlockNumber;
@@ -28,16 +29,6 @@ mod period;
 mod receipt;
 mod stellar;
 mod types;
-
-const TFGRID_MODULE: &str = "TfgridModule";
-const NODE_STORED: &str = "NodeStored";
-const NODE_UPDATED: &str = "NodeUpdated";
-const NODE_UPTIME_REPORTED: &str = "NodeUptimeReported";
-const SMART_CONTRACT_MODULE: &str = "SmartContractModule";
-const UPDATE_USED_RESOURCES: &str = "UpdatedUsedResources";
-const NRU_CONSUMPTION_RECEIVED: &str = "NruConsumptionReportReceived";
-const CONTRACT_CREATED: &str = "ContractCreated";
-const NODE_CONTRACT_CANCELLED: &str = "NodeContractCanceled";
 
 const RPC_THREADS: usize = 100;
 const PRE_FETCH: usize = 5;
@@ -157,7 +148,7 @@ async fn main() {
         );
     }
 
-    let client = Client::new(&wss_url).await.unwrap();
+    let client = DynamicClient::new(&wss_url).await.unwrap();
 
     println!("Finding start block");
     let start_block = height_at_timestamp(&client, start_ts).await.unwrap();
@@ -254,7 +245,6 @@ async fn main() {
         ProgressStyle::default_bar()
             .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
     );
-    let mut event_count = HashMap::new();
     let mut last_height = start_block - 1;
     let mut height = start_block;
     loop {
@@ -262,32 +252,23 @@ async fn main() {
         let evts = client.events(hash).await.unwrap();
         let ts = client.timestamp(hash).await.unwrap() / 1000;
         for evt in evts.iter() {
-            let evt = evt.unwrap();
-            match (evt.pallet_name(), evt.variant_name()) {
-                (TFGRID_MODULE, NODE_STORED) => {
-                    let node = evt
-                        .as_event::<runtime::api::tfgrid_module::events::NodeStored>()
-                        .unwrap()
-                        .unwrap()
-                        .0;
+            match evt {
+                RuntimeEvents::NodeStoredEvent(node) => {
                     nodes.insert(
                         node.id,
                         MintingNode {
                             id: node.id,
                             farm_id: node.farm_id,
                             twin_id: node.twin_id,
-                            resources: unsafe { mem::transmute(node.resources) },
-                            location: unsafe { mem::transmute(node.location) },
-                            country: unsafe { mem::transmute(node.country) },
-                            city: unsafe { mem::transmute(node.city) },
+                            resources: unsafe { mem::transmute(node.resources.clone()) },
+                            location: unsafe { mem::transmute(node.location.clone()) },
+                            country: unsafe { mem::transmute(node.country.clone()) },
+                            city: unsafe { mem::transmute(node.city.clone()) },
                             created: node.created,
-                            certification_type: match node.certification {
-                                tfchain_client::runtimes::v115::runtime::api::runtime_types::tfchain_support::types::NodeCertification::Diy => NodeCertification::Diy,
-                                tfchain_client::runtimes::v115::runtime::api::runtime_types::tfchain_support::types::NodeCertification::Certified => NodeCertification::Certified,
-                            },
+                            certification_type: node.certification.clone(),
                             uptime_info: None,
                             first_uptime_violation: None,
-                            connected: NodeConnected::Current(ts),
+                            connected: NodeConnected::Current(ts as i64),
                             connection_price: node.connection_price,
                             capacity_consumption: TotalConsumption::default(),
                             virtualized: node.virtualized,
@@ -295,13 +276,7 @@ async fn main() {
                         },
                     );
                 }
-                (TFGRID_MODULE, NODE_UPDATED) => {
-                    let node = evt
-                        .as_event::<runtime::api::tfgrid_module::events::NodeUpdated>()
-                        .unwrap()
-                        .unwrap()
-                        .0;
-
+                RuntimeEvents::NodeUpdatedEvent(node) => {
                     let old_node = nodes
                         .get_mut(&node.id)
                         .expect("node update of unknown node");
@@ -318,18 +293,15 @@ async fn main() {
                         std::cmp::min(old_node.resources.hru, node.resources.hru);
                     old_node.resources.sru =
                         std::cmp::min(old_node.resources.sru, node.resources.sru);
-                    old_node.location = unsafe { mem::transmute(node.location) };
-                    old_node.resources = unsafe { mem::transmute(node.resources) };
-                    old_node.country = unsafe { mem::transmute(node.country) };
-                    old_node.city = unsafe { mem::transmute(node.city) };
+                    old_node.location = unsafe { mem::transmute(node.location.clone()) };
+                    old_node.resources = unsafe { mem::transmute(node.resources.clone()) };
+                    old_node.country = unsafe { mem::transmute(node.country.clone()) };
+                    old_node.city = unsafe { mem::transmute(node.city.clone()) };
                     // Don't care about "create" as that should be fixed anyway
                     // Update certification type. It's technically possible for a node to jump
                     // from DIY to certified and back in the same period, but practically that
                     // should not happen.
-                    old_node.certification_type = match node.certification {
-                                tfchain_client::runtimes::v115::runtime::api::runtime_types::tfchain_support::types::NodeCertification::Diy => NodeCertification::Diy,
-                                tfchain_client::runtimes::v115::runtime::api::runtime_types::tfchain_support::types::NodeCertification::Certified => NodeCertification::Certified,
-                    };
+                    old_node.certification_type = node.certification.clone();
                     // It is possible that this also causes a node to get a different farming
                     // policy ID.
                     old_node.farming_policy_id = node.farming_policy_id;
@@ -347,13 +319,7 @@ async fn main() {
                         old_node.virtualized = node.virtualized;
                     }
                 }
-                (TFGRID_MODULE, NODE_UPTIME_REPORTED) => {
-                    let data = evt
-                        .as_event::<runtime::api::tfgrid_module::events::NodeUptimeReported>()
-                        .unwrap()
-                        .unwrap();
-                    let (id, current_time, reported_uptime) = (data.0, data.1, data.2);
-
+                RuntimeEvents::NodeUptimeReported(id, current_time, reported_uptime) => {
                     let node = match nodes.get_mut(&id) {
                         Some(node) => node,
                         None => panic!(
@@ -364,8 +330,8 @@ async fn main() {
                     if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
                         node.uptime_info
                     {
-                        let report_delta = current_time as i64 - last_reported_at;
-                        let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
+                        let report_delta = *current_time as i64 - last_reported_at;
+                        let uptime_delta = *reported_uptime as i64 - last_reported_uptime as i64;
                         // There are quite some situations here. Notice that due to the
                         // blockchain only producing blocks every 6 seconds, and network delay
                         // + a host of other issues, we will allow a node to report uptime with
@@ -380,7 +346,7 @@ async fn main() {
                             // above). This should be changed in the future.
                             total_uptime += uptime_delta as u64;
                             node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
+                                Some((*current_time as i64, *reported_uptime, total_uptime));
                             continue;
                         }
                         // 2. The difference in uptime is within reason of the difference in
@@ -397,7 +363,7 @@ async fn main() {
                                 // couple of seconds it will be corrected by the next pings anyhow.
                                 total_uptime += uptime_delta as u64;
                                 node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                    Some((*current_time as i64, *reported_uptime, total_uptime));
                                 continue;
                             }
                         }
@@ -407,18 +373,18 @@ async fn main() {
                         //    an uptime which is too high.
                         //
                         //    1. Uptime is within bounds.
-                        if reported_uptime as i64 <= report_delta {
-                            total_uptime += reported_uptime;
+                        if *reported_uptime as i64 <= report_delta {
+                            total_uptime += *reported_uptime;
                             node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
+                                Some((*current_time as i64, *reported_uptime, total_uptime));
                             continue;
                         }
                         //    2. Uptime is higher than previously recorded uptime but too low.
                         //    This might be a result off network congestion.
-                        if reported_uptime > last_reported_uptime {
+                        if *reported_uptime > last_reported_uptime {
                             total_uptime += uptime_delta as u64;
                             node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
+                                Some((*current_time as i64, *reported_uptime, total_uptime));
                             continue;
                         }
                         //    3. Uptime is too high, this is garbage
@@ -427,20 +393,16 @@ async fn main() {
                         }
                         continue;
                     } else {
-                        let period_duration = current_time as i64 - start_ts;
+                        let period_duration = *current_time as i64 - start_ts;
                         // Make sure we don't give more credit than the current length of the
                         // period.
-                        let up_in_period = std::cmp::min(period_duration as u64, reported_uptime);
+                        let up_in_period = std::cmp::min(period_duration as u64, *reported_uptime);
                         // Save uptime info
                         node.uptime_info =
-                            Some((current_time as i64, reported_uptime, up_in_period));
+                            Some((*current_time as i64, *reported_uptime, up_in_period));
                     }
                 }
-                (SMART_CONTRACT_MODULE, UPDATE_USED_RESOURCES) => {
-                    let data = evt
-                        .as_event::<runtime::api::smart_contract_module::events::UpdatedUsedResources>()
-                        .unwrap()
-                        .unwrap().0;
+                RuntimeEvents::ContractUsedResourcesUpdated(data) => {
                     let contract = match contracts.get_mut(&data.contract_id) {
                         Some(contract) => contract,
                         // Contract needs to exist.
@@ -448,13 +410,9 @@ async fn main() {
                             panic!("Can't set used resources for contract {} which does not exist in block {}", data.contract_id, height);
                         }
                     };
-                    contract.resources = unsafe { mem::transmute(data.used) };
+                    contract.resources = unsafe { mem::transmute(data.used.clone()) };
                 }
-                (SMART_CONTRACT_MODULE, NRU_CONSUMPTION_RECEIVED) => {
-                    let data = evt
-                        .as_event::<runtime::api::smart_contract_module::events::NruConsumptionReportReceived>()
-                        .unwrap()
-                        .unwrap().0;
+                RuntimeEvents::NruConsumptionReceived(data) => {
                     let contract = match contracts.get_mut(&data.contract_id) {
                         Some(contract) => contract,
                         // Contract needs to exist.
@@ -497,19 +455,14 @@ async fn main() {
                     node.capacity_consumption.nru += data.nru;
                     contract.last_report_ts = ts as i64;
                 }
-                (SMART_CONTRACT_MODULE, CONTRACT_CREATED) => {
-                    let contract = evt
-                        .as_event::<runtime::api::smart_contract_module::events::ContractCreated>()
-                        .unwrap()
-                        .unwrap()
-                        .0;
-                    if let runtime::api::runtime_types::pallet_smart_contract::types::ContractData::NodeContract(nc) = contract.contract_type {
+                RuntimeEvents::ContractCreated(contract) => {
+                    if let ContractData::NodeContract(nc) = &contract.contract_type {
                         contracts.insert(
                             contract.contract_id,
                             Contract {
                                 contract_id: contract.contract_id,
                                 node_id: nc.node_id,
-                                last_report_ts: ts,
+                                last_report_ts: ts as i64,
                                 ips: nc.public_ips,
                                 resources: Resources {
                                     hru: 0,
@@ -521,21 +474,11 @@ async fn main() {
                         );
                     };
                 }
-                (SMART_CONTRACT_MODULE, NODE_CONTRACT_CANCELLED) => {
-                    // Currently nothing to do here
-                }
-                (m, e) => {
-                    // Event we don't care about, track for debug purposes
-                    let count = event_count
-                        .entry((m.to_string(), e.to_string()))
-                        .or_insert(0);
-                    *count += 1
-                }
             }
         }
 
         // finally update progress bar
-        bar.set_message(Utc.timestamp(ts, 0).to_rfc2822());
+        bar.set_message(Utc.timestamp(ts as i64, 0).to_rfc2822());
         bar.inc(1);
 
         height += 1;
@@ -561,15 +504,8 @@ async fn main() {
         let evts = client.events(hash).await.unwrap();
         let ts = client.timestamp(hash).await.unwrap() / 1000;
         for evt in evts.iter() {
-            let evt = evt.unwrap();
-            match (evt.pallet_name(), evt.variant_name()) {
-                (TFGRID_MODULE, NODE_UPTIME_REPORTED) => {
-                    let data = evt
-                        .as_event::<runtime::api::tfgrid_module::events::NodeUptimeReported>()
-                        .unwrap()
-                        .unwrap();
-                    let (id, current_time, reported_uptime) = (data.0, data.1, data.2);
-
+            match evt {
+                RuntimeEvents::NodeUptimeReported(id, current_time, reported_uptime) => {
                     let node = match nodes.get_mut(&id) {
                         Some(node) => node,
                         // This is possible if its an uptime report for a node which came online after
@@ -583,8 +519,9 @@ async fn main() {
                         if last_reported_at >= end_ts {
                             continue;
                         }
-                        let report_delta = current_time as i64 - last_reported_at;
-                        let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
+                        let report_delta = *current_time as i64 - last_reported_at;
+                        let uptime_delta = *reported_uptime as i64
+                            - last_reported_uptime as i64 * *reported_uptime as i64;
                         let delta_in_period = end_ts - last_reported_at;
                         // There are quite some situations here. Notice that due to the
                         // blockchain only producing blocks every 6 seconds, and network delay
@@ -598,7 +535,7 @@ async fn main() {
                             // care for that.
                             total_uptime += delta_in_period as u64;
                             node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
+                                Some((*current_time as i64, *reported_uptime, total_uptime));
                             continue;
                         }
                         // 2. The difference in uptime is within reason of the difference in
@@ -617,7 +554,7 @@ async fn main() {
                                 // Make sure we don't add too much based on the period.
                                 total_uptime += delta_in_period as u64;
                                 node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                    Some((*current_time as i64, *reported_uptime, total_uptime));
                                 continue;
                             }
                         }
@@ -627,22 +564,22 @@ async fn main() {
                         //    an uptime which is too high.
                         //
                         //    1. Uptime is within bounds.
-                        if reported_uptime as i64 <= report_delta {
+                        if *reported_uptime as i64 <= report_delta {
                             // Account for the fact that we are actually out of the period
-                            let out_of_period = current_time - end_ts as u64;
-                            if out_of_period < reported_uptime {
-                                total_uptime += reported_uptime - out_of_period;
+                            let out_of_period = *current_time - end_ts as u64;
+                            if out_of_period < *reported_uptime {
+                                total_uptime += *reported_uptime - out_of_period;
                             }
                             node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
+                                Some((*current_time as i64, *reported_uptime, total_uptime));
                             continue;
                         }
                         //    2. Uptime is higher than previously recorded uptime but too low.
                         //    This might be a result off network congestion.
-                        if reported_uptime > last_reported_uptime {
+                        if *reported_uptime > last_reported_uptime {
                             total_uptime += uptime_delta as u64;
                             node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
+                                Some((*current_time as i64, *reported_uptime, total_uptime));
                             continue;
                         }
                         //    3. Uptime is too high, this is garbage
@@ -662,7 +599,7 @@ async fn main() {
         }
 
         //bar.set_message(format!("{}/7200", height - end_block,));
-        bar.set_message(Utc.timestamp(ts, 0).to_rfc2822());
+        bar.set_message(Utc.timestamp(ts as i64, 0).to_rfc2822());
         bar.inc(1);
 
         height += 1;
