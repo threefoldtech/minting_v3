@@ -1199,7 +1199,7 @@ impl MintingNode {
             }
 
             // Scale payouts for now, remember to divide by the upscale.
-            if self.farming_policy_id == 1 {
+            if self.farming_policy_id == 1 || self.farming_policy_id == 2 {
                 (
                     self.node_payout_musd(farming_policies) * uptime_percentage / 1_000,
                     self.node_payout_tft_units(farming_policies) * uptime_percentage / 1_000,
