@@ -15,6 +15,7 @@ use std::{
     path,
 };
 use tfchain_client::dynamic::DynamicClient;
+use tokio::sync::mpsc;
 // use tfchain_client::runtimes::v115::{client::Client, runtime};
 use tfchain_client::{
     client::{height_at_timestamp, RuntimeClient},
@@ -30,7 +31,7 @@ mod receipt;
 mod stellar;
 mod types;
 
-const RPC_THREADS: usize = 100;
+const RPC_THREADS: usize = 10;
 const PRE_FETCH: usize = 5;
 const UPTIME_GRACE_PERIOD_SECONDS: i64 = 300; // 5 Minutes
 const GIB: u128 = 1024 * 1024 * 1024;
@@ -245,10 +246,19 @@ async fn main() {
     );
     let mut last_height = start_block - 1;
     let mut height = start_block;
+    let mut import_queue = block_import(&wss_url, height as usize, end_block as usize).await;
     loop {
-        let hash = client.hash_at_height(Some(height)).await.unwrap();
-        let evts = client.events(hash).await.unwrap();
-        let ts = client.timestamp(hash).await.unwrap() / 1000;
+        //let hash = client.hash_at_height(Some(height)).await.unwrap();
+        // let ts = client.timestamp(hash).await.unwrap() / 1000;
+        // let evts = client.events(hash).await.unwrap();
+        // let (ts_res, evts_res) = futures::join!(client.timestamp(hash), client.events(hash));
+        // let ts = ts_res.unwrap() / 1000;
+        // let evts = evts_res.unwrap();
+        let (ts, evts) = if let Some((ts, evts)) = import_queue.recv().await {
+            (ts, evts)
+        } else {
+            panic!("Block import exitted too early");
+        };
         for evt in evts.into_iter() {
             match evt {
                 RuntimeEvents::NodeStoredEvent(node) => {
@@ -1346,4 +1356,51 @@ pub async fn get_farming_policies(
         }
     }
     Ok(policies)
+}
+
+async fn block_import(
+    wss_url: &str,
+    start: usize,
+    end: usize,
+) -> mpsc::Receiver<(i64, Vec<RuntimeEvents>)> {
+    let mut t_rec = Vec::with_capacity(RPC_THREADS);
+    for i in 0..RPC_THREADS {
+        let client = DynamicClient::new(&wss_url).await.unwrap();
+        let (tx, rx) = mpsc::channel(5);
+        let mut height = start + i;
+        tokio::task::spawn(async move {
+            loop {
+                let hash = client.hash_at_height(Some(height as u32)).await.unwrap();
+                let evts = client.events(hash).await.unwrap();
+                let ts = client.timestamp(hash).await.unwrap() / 1000;
+                if let Err(e) = tx.send((ts as i64, evts)).await {
+                    panic!("{e}");
+                }
+                height += RPC_THREADS;
+
+                if height > end {
+                    break;
+                }
+            }
+        });
+        t_rec.push(rx);
+    }
+
+    let (tx, rx) = mpsc::channel(5);
+    tokio::task::spawn(async move {
+        let mut i = 0;
+        let l = t_rec.len();
+        loop {
+            if let Some(r) = t_rec[i % l].recv().await {
+                if let Err(e) = tx.send(r).await {
+                    panic!("{e}");
+                }
+            } else {
+                break;
+            }
+            i += 1;
+        }
+    });
+
+    rx
 }
