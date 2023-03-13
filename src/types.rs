@@ -71,7 +71,7 @@ pub struct ContractResources {
     pub used: Resources,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Default, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct PricingPolicy {
     pub version: u32,
     pub id: u32,
@@ -114,7 +114,7 @@ impl Balance {
 
 pub type BlockNumber = u32;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Default, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct Twin {
     pub version: u32,
     pub id: u32,
@@ -123,7 +123,7 @@ pub struct Twin {
     pub entities: Vec<EntityProof>,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct Entity {
     pub version: u32,
     pub id: u32,
