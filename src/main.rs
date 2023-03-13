@@ -10,7 +10,6 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     io::Write,
-    mem,
     os::unix::prelude::OsStrExt,
     path,
 };
@@ -24,7 +23,6 @@ use tfchain_client::{
         Node, NodeCertification, Resources, RuntimeEvents,
     },
 };
-use types::BlockNumber;
 
 mod period;
 mod receipt;
@@ -248,12 +246,6 @@ async fn main() {
     let mut height = start_block;
     let mut import_queue = block_import(&wss_url, height as usize, end_block as usize).await;
     loop {
-        //let hash = client.hash_at_height(Some(height)).await.unwrap();
-        // let ts = client.timestamp(hash).await.unwrap() / 1000;
-        // let evts = client.events(hash).await.unwrap();
-        // let (ts_res, evts_res) = futures::join!(client.timestamp(hash), client.events(hash));
-        // let ts = ts_res.unwrap() / 1000;
-        // let evts = evts_res.unwrap();
         let (ts, evts) = if let Some((ts, evts)) = import_queue.recv().await {
             (ts, evts)
         } else {
@@ -858,89 +850,6 @@ async fn main() {
         path.push(hash);
         std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
     }
-}
-
-// fn block_import<P, E>(
-//     client: SharedClient<P, E>,
-//     start: BlockNumber,
-//     end: BlockNumber,
-//     network: tfchain_client::window::Network,
-// ) -> mpsc::Receiver<MintingBlock>
-// where
-//     P: Pair,
-//     MultiSignature: From<P::Signature>,
-//     E: tfchain_client::support::sp_runtime::traits::Member + tfchain_client::support::Parameter,
-//     TfchainEvent: From<E>,
-//     tfchain_client::window::EventTypedClient<P>: From<SharedClient<P, E>>,
-// {
-//     let mut receivers = Vec::with_capacity(RPC_THREADS);
-//
-//     for i in 0..RPC_THREADS {
-//         let (tx, rx) = mpsc::sync_channel(PRE_FETCH);
-//         receivers.push(rx);
-//         let client = client.clone();
-//         let mut height = start + i as u32;
-//         std::thread::spawn(move || loop {
-//             if height > end {
-//                 break;
-//             }
-//             let window = match Window::at_height(client.clone(), height, network) {
-//                 Ok(maybe_window) => maybe_window.unwrap(),
-//                 Err(e) => {
-//                     eprintln!("Could not create window at height {}: {}", height, e);
-//                     std::thread::sleep(std::time::Duration::from_secs(1));
-//                     continue;
-//                 }
-//             };
-//             let timestamp = match window.date() {
-//                 Ok(ts) => ts,
-//                 Err(e) => {
-//                     eprintln!("Could not fetch time at height {}: {}", height, e);
-//                     continue;
-//                 }
-//             };
-//             let events = match window.events() {
-//                 Ok(evt) => evt,
-//                 Err(e) => {
-//                     eprintln!("Failed to fetch events at height {}: {}", height, e);
-//                     continue;
-//                 }
-//             };
-//             tx.send(MintingBlock {
-//                 height,
-//                 timestamp,
-//                 events,
-//             })
-//             .unwrap();
-//             height += RPC_THREADS as u32;
-//         });
-//     }
-//
-//     let (tx, rx) = mpsc::channel();
-//     std::thread::spawn(move || loop {
-//         let mut disconnects = 0;
-//         for rx in &receivers {
-//             let res = match rx.recv() {
-//                 Ok(res) => res,
-//                 Err(_) => {
-//                     disconnects += 1;
-//                     continue;
-//                 }
-//             };
-//             tx.send(res).unwrap();
-//         }
-//         if disconnects == receivers.len() {
-//             break;
-//         }
-//     });
-//
-//     rx
-// }
-
-struct MintingBlock {
-    height: BlockNumber,
-    timestamp: DateTime<Utc>,
-    events: Vec<tfchain_client::client::Events<tfchain_client::client::PolkadotConfig>>,
 }
 
 enum NodeConnected {
