@@ -4237,7 +4237,7 @@ dependencies = [
 [[package]]
 name = "tfchain_client"
 version = "0.1.0"
-source = "git+https://github.com/threefoldtech/tfchain_client?branch=v123_type#55d4d897f3b61d28d7f245ace31ddabbc4a7dbc4"
+source = "git+https://github.com/threefoldtech/tfchain_client?branch=v123_type#b83c9c34cff38cfec04d683035a7e6ce1f5902c8"
 dependencies = [
  "async-trait",
  "parity-scale-codec",
