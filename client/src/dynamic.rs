@@ -10,6 +10,11 @@ use crate::runtimes::{
         V123ContractResources, V123ContractUpdatedResourcesEvent, V123Farm, V123FarmingPolicy,
         V123Node, V123NodeStoredEvent, V123NodeUpdatedEvent, V123NodeUptimeReportedEvent, V123Twin,
     },
+    v131::types::{
+        V131Contract, V131ContractCreatedEvent, V131ContractNruConsumptionReceivedEvent,
+        V131ContractResources, V131ContractUpdatedResourcesEvent, V131Farm, V131FarmingPolicy,
+        V131Node, V131NodeStoredEvent, V131NodeUpdatedEvent, V131NodeUptimeReportedEvent, V131Twin,
+    },
 };
 use crate::types::{
     Contract, ContractResources, Farm, FarmPolicy, Hash, Node, RuntimeEvents, Twin, CONTRACTS,
@@ -18,6 +23,7 @@ use crate::types::{
     NODE_UPTIME_REPORTED, NRU_CONSUMPTION_RECEIVED, SMART_CONTRACT_MODULE, TFGRID_MODULE,
     TIMESTAMP_MODULE, TIMESTAMP_NOW, TWINS, TWIN_ID, UPDATE_USED_RESOURCES,
 };
+use std::{error, fmt};
 use subxt::storage::DynamicStorageAddress;
 use subxt::{
     dynamic::Value,
@@ -28,10 +34,32 @@ use subxt::{
 };
 use tokio::join;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Error {
     ErrorDecodingTwin,
+    ErrorDecodingFarm,
+    ErrorDecodingNode,
+    ErrorDecodingContract,
+    ErrorDecodingContractResources,
+    ErrorDecodingFarmingPolicy,
 }
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::ErrorDecodingTwin => write!(f, "failed to decode twin"),
+            Error::ErrorDecodingNode => write!(f, "failed to decode node"),
+            Error::ErrorDecodingFarm => write!(f, "failed to decode farm"),
+            Error::ErrorDecodingContract => write!(f, "failed to decode contract"),
+            Error::ErrorDecodingContractResources => {
+                write!(f, "failed to decode contract resources")
+            }
+            Error::ErrorDecodingFarmingPolicy => write!(f, "failed to decode farming policy"),
+        }
+    }
+}
+
+impl error::Error for Error {}
 
 pub struct DynamicClient {
     api: OnlineClient<PolkadotConfig>,
@@ -74,12 +102,16 @@ impl RuntimeClient for DynamicClient {
                         events.push(RuntimeEvents::NodeStoredEvent(evt.0.into()));
                     } else if let Ok(Some(evt)) = evt.as_event::<V123NodeStoredEvent>() {
                         events.push(RuntimeEvents::NodeStoredEvent(evt.0.into()));
+                    } else if let Ok(Some(evt)) = evt.as_event::<V131NodeStoredEvent>() {
+                        events.push(RuntimeEvents::NodeStoredEvent(evt.0.into()));
                     };
                 }
                 (TFGRID_MODULE, NODE_UPDATED) => {
                     if let Ok(Some(evt)) = evt.as_event::<V115NodeUpdatedEvent>() {
                         events.push(RuntimeEvents::NodeUpdatedEvent(evt.0.into()));
                     } else if let Ok(Some(evt)) = evt.as_event::<V123NodeUpdatedEvent>() {
+                        events.push(RuntimeEvents::NodeUpdatedEvent(evt.0.into()));
+                    } else if let Ok(Some(evt)) = evt.as_event::<V131NodeUpdatedEvent>() {
                         events.push(RuntimeEvents::NodeUpdatedEvent(evt.0.into()));
                     };
                 }
@@ -88,6 +120,8 @@ impl RuntimeClient for DynamicClient {
                         events.push(RuntimeEvents::NodeUptimeReported(evt.0, evt.1, evt.2));
                     } else if let Ok(Some(evt)) = evt.as_event::<V123NodeUptimeReportedEvent>() {
                         events.push(RuntimeEvents::NodeUptimeReported(evt.0, evt.1, evt.2));
+                    } else if let Ok(Some(evt)) = evt.as_event::<V131NodeUptimeReportedEvent>() {
+                        events.push(RuntimeEvents::NodeUptimeReported(evt.0, evt.1, evt.2));
                     };
                 }
                 (SMART_CONTRACT_MODULE, UPDATE_USED_RESOURCES) => {
@@ -95,6 +129,10 @@ impl RuntimeClient for DynamicClient {
                         events.push(RuntimeEvents::ContractUsedResourcesUpdated(evt.0.into()));
                     } else if let Ok(Some(evt)) =
                         evt.as_event::<V123ContractUpdatedResourcesEvent>()
+                    {
+                        events.push(RuntimeEvents::ContractUsedResourcesUpdated(evt.0.into()));
+                    } else if let Ok(Some(evt)) =
+                        evt.as_event::<V131ContractUpdatedResourcesEvent>()
                     {
                         events.push(RuntimeEvents::ContractUsedResourcesUpdated(evt.0.into()));
                     };
@@ -107,12 +145,18 @@ impl RuntimeClient for DynamicClient {
                         evt.as_event::<V123ContractNruConsumptionReceivedEvent>()
                     {
                         events.push(RuntimeEvents::NruConsumptionReceived(evt.0.into()));
+                    } else if let Ok(Some(evt)) =
+                        evt.as_event::<V131ContractNruConsumptionReceivedEvent>()
+                    {
+                        events.push(RuntimeEvents::NruConsumptionReceived(evt.0.into()));
                     };
                 }
                 (SMART_CONTRACT_MODULE, CONTRACT_CREATED) => {
                     if let Ok(Some(evt)) = evt.as_event::<V115ContractCreatedEvent>() {
                         events.push(RuntimeEvents::ContractCreated(evt.0.into()));
                     } else if let Ok(Some(evt)) = evt.as_event::<V123ContractCreatedEvent>() {
+                        events.push(RuntimeEvents::ContractCreated(evt.0.into()));
+                    } else if let Ok(Some(evt)) = evt.as_event::<V131ContractCreatedEvent>() {
                         events.push(RuntimeEvents::ContractCreated(evt.0.into()));
                     };
                 }
@@ -173,12 +217,14 @@ impl RuntimeClient for DynamicClient {
 
         let r: Vec<u8> = result.unwrap().into_encoded().into();
 
-        let twinv115: Result<V115Twin, codec::Error> = codec::decode_from_bytes(r.clone().into());
-        if let Ok(twin) = twinv115 {
+        if let Ok(twin) = codec::decode_from_bytes::<V115Twin>(r.clone().into()) {
+            Ok(Some(twin.into()))
+        } else if let Ok(twin) = codec::decode_from_bytes::<V123Twin>(r.clone().into()) {
+            Ok(Some(twin.into()))
+        } else if let Ok(twin) = codec::decode_from_bytes::<V131Twin>(r.clone().into()) {
             Ok(Some(twin.into()))
         } else {
-            let twinv123: V123Twin = codec::decode_from_bytes(r.into())?;
-            Ok(Some(twinv123.into()))
+            return Err(Error::ErrorDecodingTwin.into());
         }
     }
 
@@ -220,12 +266,14 @@ impl RuntimeClient for DynamicClient {
 
         let r: Vec<u8> = result.unwrap().into_encoded().into();
 
-        let farmv115: Result<V115Farm, codec::Error> = codec::decode_from_bytes(r.clone().into());
-        if let Ok(farm) = farmv115 {
+        if let Ok(farm) = codec::decode_from_bytes::<V115Farm>(r.clone().into()) {
+            Ok(Some(farm.into()))
+        } else if let Ok(farm) = codec::decode_from_bytes::<V123Farm>(r.clone().into()) {
+            Ok(Some(farm.into()))
+        } else if let Ok(farm) = codec::decode_from_bytes::<V131Farm>(r.clone().into()) {
             Ok(Some(farm.into()))
         } else {
-            let farmv123: V123Farm = codec::decode_from_bytes(r.into())?;
-            Ok(Some(farmv123.into()))
+            return Err(Error::ErrorDecodingFarm.into());
         }
     }
 
@@ -295,12 +343,14 @@ impl RuntimeClient for DynamicClient {
 
         let r: Vec<u8> = result.unwrap().into_encoded().into();
 
-        let nodev115: Result<V115Node, codec::Error> = codec::decode_from_bytes(r.clone().into());
-        if let Ok(node) = nodev115 {
+        if let Ok(node) = codec::decode_from_bytes::<V115Node>(r.clone().into()) {
+            Ok(Some(node.into()))
+        } else if let Ok(node) = codec::decode_from_bytes::<V123Node>(r.clone().into()) {
+            Ok(Some(node.into()))
+        } else if let Ok(node) = codec::decode_from_bytes::<V131Node>(r.clone().into()) {
             Ok(Some(node.into()))
         } else {
-            let nodev123: V123Node = codec::decode_from_bytes(r.into())?;
-            Ok(Some(nodev123.into()))
+            return Err(Error::ErrorDecodingNode.into());
         }
     }
 
@@ -345,12 +395,14 @@ impl RuntimeClient for DynamicClient {
 
         let r: Vec<u8> = result.unwrap().into_encoded().into();
 
-        let cv115: Result<V115Contract, codec::Error> = codec::decode_from_bytes(r.clone().into());
-        if let Ok(contract) = cv115 {
+        if let Ok(contract) = codec::decode_from_bytes::<V115Contract>(r.clone().into()) {
+            Ok(Some(contract.into()))
+        } else if let Ok(contract) = codec::decode_from_bytes::<V123Contract>(r.clone().into()) {
+            Ok(Some(contract.into()))
+        } else if let Ok(contract) = codec::decode_from_bytes::<V131Contract>(r.clone().into()) {
             Ok(Some(contract.into()))
         } else {
-            let cv123: V123Contract = codec::decode_from_bytes(r.into())?;
-            Ok(Some(cv123.into()))
+            return Err(Error::ErrorDecodingContract.into());
         }
     }
 
@@ -379,13 +431,18 @@ impl RuntimeClient for DynamicClient {
 
         let r: Vec<u8> = result.unwrap().into_encoded().into();
 
-        let crv115: Result<V115ContractResources, codec::Error> =
-            codec::decode_from_bytes(r.clone().into());
-        if let Ok(resources) = crv115 {
-            Ok(Some(resources.into()))
+        if let Ok(contract) = codec::decode_from_bytes::<V115ContractResources>(r.clone().into()) {
+            Ok(Some(contract.into()))
+        } else if let Ok(contract) =
+            codec::decode_from_bytes::<V123ContractResources>(r.clone().into())
+        {
+            Ok(Some(contract.into()))
+        } else if let Ok(contract) =
+            codec::decode_from_bytes::<V131ContractResources>(r.clone().into())
+        {
+            Ok(Some(contract.into()))
         } else {
-            let crv123: V123ContractResources = codec::decode_from_bytes(r.into())?;
-            Ok(Some(crv123.into()))
+            return Err(Error::ErrorDecodingContractResources.into());
         }
     }
 
@@ -430,13 +487,14 @@ impl RuntimeClient for DynamicClient {
 
         let r: Vec<u8> = result.unwrap().into_encoded().into();
 
-        let fpv115: Result<V115FarmingPolicy, codec::Error> =
-            codec::decode_from_bytes(r.clone().into());
-        if let Ok(policy) = fpv115 {
+        if let Ok(policy) = codec::decode_from_bytes::<V115FarmingPolicy>(r.clone().into()) {
+            Ok(Some(policy.into()))
+        } else if let Ok(policy) = codec::decode_from_bytes::<V123FarmingPolicy>(r.clone().into()) {
+            Ok(Some(policy.into()))
+        } else if let Ok(policy) = codec::decode_from_bytes::<V131FarmingPolicy>(r.clone().into()) {
             Ok(Some(policy.into()))
         } else {
-            let fpv123: V123FarmingPolicy = codec::decode_from_bytes(r.into())?;
-            Ok(Some(fpv123.into()))
+            return Err(Error::ErrorDecodingFarmingPolicy.into());
         }
     }
 
