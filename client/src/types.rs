@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 /// The hash type used on the TfChain.
 pub type Hash = subxt::utils::H256;
 use subxt::utils::AccountId32;
@@ -40,7 +39,7 @@ pub struct Twin {
     pub id: u32,
     // TODO: proper typing
     pub account_id: AccountId32,
-    pub ip: IpAddr,
+    pub ip: String,
     pub entities: Vec<EntityProof>,
 }
 
