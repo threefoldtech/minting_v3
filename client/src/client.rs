@@ -2,7 +2,7 @@ pub use subxt::events::Events;
 pub use subxt::PolkadotConfig;
 
 use crate::types::{
-    Contract, ContractResources, Farm, FarmPolicy, Hash, Node, RuntimeEvents, Twin,
+    Contract, ContractResources, Farm, FarmPolicy, Hash, Node, NodePower, RuntimeEvents, Twin,
 };
 
 /// The expected amount of seconds per block.
@@ -105,6 +105,13 @@ pub trait RuntimeClient {
         &self,
         block: Option<Hash>,
     ) -> Result<u32, Box<dyn std::error::Error>>;
+
+    /// Get the NodePower for a node
+    async fn node_power(
+        &self,
+        id: u32,
+        block: Option<Hash>,
+    ) -> Result<Option<NodePower>, Box<dyn std::error::Error>>;
 }
 
 /// Find the height of the chain at the given timestamp.

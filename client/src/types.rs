@@ -20,6 +20,7 @@ pub const FARM_PAYOUT_V2_ADDRESS: &str = "FarmPayoutV2AddressByFarmID";
 pub const TWINS: &str = "Twins";
 pub const TWIN_ID: &str = "TwinID";
 pub const FARMS: &str = "Farms";
+pub const NODE_POWER: &str = "NodePower";
 
 pub const SMART_CONTRACT_MODULE: &str = "SmartContractModule";
 pub const UPDATE_USED_RESOURCES: &str = "UpdatedUsedResources";
@@ -232,6 +233,24 @@ pub struct NruConsumption {
     pub timestamp: u64,
     pub window: u64,
     pub nru: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum PowerState {
+    Up,
+    Down(u32),
+}
+
+#[derive(Debug, Clone)]
+pub enum Power {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodePower {
+    pub state: PowerState,
+    pub target: Power,
 }
 
 #[derive(Debug, Clone)]

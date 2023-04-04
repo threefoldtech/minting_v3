@@ -23,14 +23,15 @@ use super::runtime::api::runtime_types::{
         Farm as RuntimeFarm, FarmCertification as RuntimeFarmCertification,
         FarmingPolicyLimit as RuntimeFarmingPolicyLimit, Interface as RuntimeInterface,
         Node as RuntimeNode, NodeCertification as RuntimeNodeCertification,
+        NodePower as RuntimeNodePower, Power as RuntimePower, PowerState as RuntimePowerState,
         PublicIP as RuntimePublicIP,
     },
 };
 use crate::types::{
     Cause, Contract, ContractData, ContractResources, ContractState, Domain, EntityProof, Farm,
     FarmCertification, FarmPolicy, FarmingPolicyLimit, Interface, Location, NameContract, Node,
-    NodeCertification, NodeContract, NruConsumption, PubIPConfig, PublicConfig, PublicIP,
-    RentContract, Resources, Twin,
+    NodeCertification, NodeContract, NodePower, NruConsumption, Power, PowerState, PubIPConfig,
+    PublicConfig, PublicIP, RentContract, Resources, Twin,
 };
 use subxt::utils::AccountId32;
 
@@ -41,6 +42,9 @@ pub type V131Node = RuntimeNode<
     RuntimeInterface<RuntimeInterfaceName, RuntimeInterfaceMac, BoundedVec<RuntimeInterfaceIp>>,
     SerialNumber,
 >;
+pub type V131NodePower = RuntimeNodePower<u32>;
+pub type V131PowerState = RuntimePowerState<u32>;
+pub type V131Power = RuntimePower;
 pub type V131Contract = RuntimeContract;
 pub type V131ContractResources = RuntimeContractResources;
 pub type V131FarmingPolicy = RuntimeFarmingPolicy<u32>;
@@ -472,6 +476,34 @@ impl From<RuntimeNruResources> for NruConsumption {
             timestamp,
             window,
             nru,
+        }
+    }
+}
+
+impl From<RuntimePowerState<u32>> for PowerState {
+    fn from(rps: RuntimePowerState<u32>) -> Self {
+        match rps {
+            RuntimePowerState::Up => PowerState::Up,
+            RuntimePowerState::Down(block) => PowerState::Down(block),
+        }
+    }
+}
+
+impl From<RuntimePower> for Power {
+    fn from(rp: RuntimePower) -> Self {
+        match rp {
+            RuntimePower::Up => Power::Up,
+            RuntimePower::Down => Power::Down,
+        }
+    }
+}
+
+impl From<RuntimeNodePower<u32>> for NodePower {
+    fn from(rnp: RuntimeNodePower<u32>) -> Self {
+        let RuntimeNodePower { state, target } = rnp;
+        NodePower {
+            state: state.into(),
+            target: target.into(),
         }
     }
 }
