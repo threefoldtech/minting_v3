@@ -254,6 +254,20 @@ pub struct NodePower {
 }
 
 #[derive(Debug, Clone)]
+pub struct PowerStateChanged {
+    pub farm_id: u32,
+    pub node_id: u32,
+    pub power_state: PowerState,
+}
+
+#[derive(Debug, Clone)]
+pub struct PowerTargetChanged {
+    pub farm_id: u32,
+    pub node_id: u32,
+    pub power_target: Power,
+}
+
+#[derive(Debug, Clone)]
 pub enum RuntimeEvents {
     NodeStoredEvent(Node),
     NodeUpdatedEvent(Node),
@@ -261,4 +275,6 @@ pub enum RuntimeEvents {
     ContractCreated(Contract),
     ContractUsedResourcesUpdated(ContractResources),
     NruConsumptionReceived(NruConsumption),
+    PowerStateChanged(PowerStateChanged),
+    PowerTargetChanged(PowerTargetChanged),
 }

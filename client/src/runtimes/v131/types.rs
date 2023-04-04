@@ -30,8 +30,9 @@ use super::runtime::api::runtime_types::{
 use crate::types::{
     Cause, Contract, ContractData, ContractResources, ContractState, Domain, EntityProof, Farm,
     FarmCertification, FarmPolicy, FarmingPolicyLimit, Interface, Location, NameContract, Node,
-    NodeCertification, NodeContract, NodePower, NruConsumption, Power, PowerState, PubIPConfig,
-    PublicConfig, PublicIP, RentContract, Resources, Twin,
+    NodeCertification, NodeContract, NodePower, NruConsumption, Power, PowerState,
+    PowerStateChanged, PowerTargetChanged, PubIPConfig, PublicConfig, PublicIP, RentContract,
+    Resources, Twin,
 };
 use subxt::utils::AccountId32;
 
@@ -59,6 +60,9 @@ pub type V131ContractUpdatedResourcesEvent =
     super::runtime::api::smart_contract_module::events::UpdatedUsedResources;
 pub type V131ContractNruConsumptionReceivedEvent =
     super::runtime::api::smart_contract_module::events::NruConsumptionReportReceived;
+pub type V131PowerTargetChangedEvent =
+    super::runtime::api::tfgrid_module::events::PowerTargetChanged;
+pub type V131PowerStateChangedEvent = super::runtime::api::tfgrid_module::events::PowerStateChanged;
 
 impl From<RuntimeTwin<AccountId32>> for Twin {
     fn from(rt: RuntimeTwin<AccountId32>) -> Self {
@@ -504,6 +508,36 @@ impl From<RuntimeNodePower<u32>> for NodePower {
         NodePower {
             state: state.into(),
             target: target.into(),
+        }
+    }
+}
+
+impl From<V131PowerStateChangedEvent> for PowerStateChanged {
+    fn from(psce: V131PowerStateChangedEvent) -> Self {
+        let V131PowerStateChangedEvent {
+            farm_id,
+            node_id,
+            power_state,
+        } = psce;
+        PowerStateChanged {
+            farm_id,
+            node_id,
+            power_state: power_state.into(),
+        }
+    }
+}
+
+impl From<V131PowerTargetChangedEvent> for PowerTargetChanged {
+    fn from(ptce: V131PowerTargetChangedEvent) -> Self {
+        let V131PowerTargetChangedEvent {
+            farm_id,
+            node_id,
+            power_target,
+        } = ptce;
+        PowerTargetChanged {
+            farm_id,
+            node_id,
+            power_target: power_target.into(),
         }
     }
 }
