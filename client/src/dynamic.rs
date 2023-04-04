@@ -13,15 +13,16 @@ use crate::runtimes::{
     v131::types::{
         V131Contract, V131ContractCreatedEvent, V131ContractNruConsumptionReceivedEvent,
         V131ContractResources, V131ContractUpdatedResourcesEvent, V131Farm, V131FarmingPolicy,
-        V131Node, V131NodeStoredEvent, V131NodeUpdatedEvent, V131NodeUptimeReportedEvent, V131Twin,
+        V131Node, V131NodePower, V131NodeStoredEvent, V131NodeUpdatedEvent,
+        V131NodeUptimeReportedEvent, V131Twin,
     },
 };
 use crate::types::{
-    Contract, ContractResources, Farm, FarmPolicy, Hash, Node, RuntimeEvents, Twin, CONTRACTS,
-    CONTRACT_CREATED, CONTRACT_ID, FARMING_POLICIES, FARMING_POLICY_ID, FARMS, FARM_ID,
-    FARM_PAYOUT_V2_ADDRESS, NODES, NODE_CONTRACT_RESOURCES, NODE_ID, NODE_STORED, NODE_UPDATED,
-    NODE_UPTIME_REPORTED, NRU_CONSUMPTION_RECEIVED, SMART_CONTRACT_MODULE, TFGRID_MODULE,
-    TIMESTAMP_MODULE, TIMESTAMP_NOW, TWINS, TWIN_ID, UPDATE_USED_RESOURCES,
+    Contract, ContractResources, Farm, FarmPolicy, Hash, Node, NodePower, RuntimeEvents, Twin,
+    CONTRACTS, CONTRACT_CREATED, CONTRACT_ID, FARMING_POLICIES, FARMING_POLICY_ID, FARMS, FARM_ID,
+    FARM_PAYOUT_V2_ADDRESS, NODES, NODE_CONTRACT_RESOURCES, NODE_ID, NODE_POWER, NODE_STORED,
+    NODE_UPDATED, NODE_UPTIME_REPORTED, NRU_CONSUMPTION_RECEIVED, SMART_CONTRACT_MODULE,
+    TFGRID_MODULE, TIMESTAMP_MODULE, TIMESTAMP_NOW, TWINS, TWIN_ID, UPDATE_USED_RESOURCES,
 };
 use std::{error, fmt};
 use subxt::storage::DynamicStorageAddress;
@@ -42,6 +43,7 @@ pub enum Error {
     ErrorDecodingContract,
     ErrorDecodingContractResources,
     ErrorDecodingFarmingPolicy,
+    ErrorDecodingNodePower,
 }
 
 impl fmt::Display for Error {
@@ -55,6 +57,7 @@ impl fmt::Display for Error {
                 write!(f, "failed to decode contract resources")
             }
             Error::ErrorDecodingFarmingPolicy => write!(f, "failed to decode farming policy"),
+            Error::ErrorDecodingNodePower => write!(f, "failed to decode node power"),
         }
     }
 }
@@ -515,5 +518,34 @@ impl RuntimeClient for DynamicClient {
             .to_value()?;
 
         Ok(result.as_u128().map_or(0, |x| x as u32))
+    }
+
+    /// Get the NodePower for a node
+    async fn node_power(
+        &self,
+        id: u32,
+        block: Option<Hash>,
+    ) -> Result<Option<NodePower>, Box<dyn std::error::Error>> {
+        let storage_address =
+            subxt::dynamic::storage(TFGRID_MODULE, NODE_POWER, vec![Value::u128(id.into())]);
+        let result = self
+            .api
+            .storage()
+            .at(block)
+            .await?
+            .fetch(&storage_address)
+            .await?;
+
+        if result.is_none() {
+            return Ok(None);
+        }
+
+        let r: Vec<u8> = result.unwrap().into_encoded().into();
+
+        if let Ok(node_power) = codec::decode_from_bytes::<V131NodePower>(r.into()) {
+            Ok(Some(node_power.into()))
+        } else {
+            return Err(Error::ErrorDecodingFarmingPolicy.into());
+        }
     }
 }
