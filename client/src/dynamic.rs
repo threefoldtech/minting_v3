@@ -1,4 +1,5 @@
 use crate::client::RuntimeClient;
+use crate::runtimes::v131::types::{V131PowerStateChangedEvent, V131PowerTargetChangedEvent};
 use crate::runtimes::{
     v115::types::{
         V115Contract, V115ContractCreatedEvent, V115ContractNruConsumptionReceivedEvent,
@@ -21,8 +22,9 @@ use crate::types::{
     Contract, ContractResources, Farm, FarmPolicy, Hash, Node, NodePower, RuntimeEvents, Twin,
     CONTRACTS, CONTRACT_CREATED, CONTRACT_ID, FARMING_POLICIES, FARMING_POLICY_ID, FARMS, FARM_ID,
     FARM_PAYOUT_V2_ADDRESS, NODES, NODE_CONTRACT_RESOURCES, NODE_ID, NODE_POWER, NODE_STORED,
-    NODE_UPDATED, NODE_UPTIME_REPORTED, NRU_CONSUMPTION_RECEIVED, SMART_CONTRACT_MODULE,
-    TFGRID_MODULE, TIMESTAMP_MODULE, TIMESTAMP_NOW, TWINS, TWIN_ID, UPDATE_USED_RESOURCES,
+    NODE_UPDATED, NODE_UPTIME_REPORTED, NRU_CONSUMPTION_RECEIVED, POWER_STATE_CHANGED,
+    POWER_TARGET_CHANGED, SMART_CONTRACT_MODULE, TFGRID_MODULE, TIMESTAMP_MODULE, TIMESTAMP_NOW,
+    TWINS, TWIN_ID, UPDATE_USED_RESOURCES,
 };
 use std::{error, fmt};
 use subxt::storage::DynamicStorageAddress;
@@ -161,6 +163,16 @@ impl RuntimeClient for DynamicClient {
                         events.push(RuntimeEvents::ContractCreated(evt.0.into()));
                     } else if let Ok(Some(evt)) = evt.as_event::<V131ContractCreatedEvent>() {
                         events.push(RuntimeEvents::ContractCreated(evt.0.into()));
+                    };
+                }
+                (TFGRID_MODULE, POWER_STATE_CHANGED) => {
+                    if let Ok(Some(evt)) = evt.as_event::<V131PowerStateChangedEvent>() {
+                        events.push(RuntimeEvents::PowerStateChanged(evt.into()));
+                    };
+                }
+                (TFGRID_MODULE, POWER_TARGET_CHANGED) => {
+                    if let Ok(Some(evt)) = evt.as_event::<V131PowerTargetChangedEvent>() {
+                        events.push(RuntimeEvents::PowerTargetChanged(evt.into()));
                     };
                 }
                 (_m, _e) => (),
