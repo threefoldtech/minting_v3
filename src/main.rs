@@ -520,8 +520,7 @@ async fn main() {
                             continue;
                         }
                         let report_delta = current_time as i64 - last_reported_at;
-                        let uptime_delta = reported_uptime as i64
-                            - last_reported_uptime as i64 * reported_uptime as i64;
+                        let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
                         let delta_in_period = end_ts - last_reported_at;
                         // There are quite some situations here. Notice that due to the
                         // blockchain only producing blocks every 6 seconds, and network delay
