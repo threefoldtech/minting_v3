@@ -503,7 +503,7 @@ async fn main() {
         let hash = client.hash_at_height(Some(height)).await.unwrap();
         let evts = client.events(hash).await.unwrap();
         let ts = client.timestamp(hash).await.unwrap() / 1000;
-        for evt in evts.iter() {
+        for evt in evts.into_iter() {
             match evt {
                 RuntimeEvents::NodeUptimeReported(id, current_time, reported_uptime) => {
                     let node = match nodes.get_mut(&id) {
@@ -519,9 +519,9 @@ async fn main() {
                         if last_reported_at >= end_ts {
                             continue;
                         }
-                        let report_delta = *current_time as i64 - last_reported_at;
-                        let uptime_delta = *reported_uptime as i64
-                            - last_reported_uptime as i64 * *reported_uptime as i64;
+                        let report_delta = current_time as i64 - last_reported_at;
+                        let uptime_delta = reported_uptime as i64
+                            - last_reported_uptime as i64 * reported_uptime as i64;
                         let delta_in_period = end_ts - last_reported_at;
                         // There are quite some situations here. Notice that due to the
                         // blockchain only producing blocks every 6 seconds, and network delay
@@ -535,7 +535,7 @@ async fn main() {
                             // care for that.
                             total_uptime += delta_in_period as u64;
                             node.uptime_info =
-                                Some((*current_time as i64, *reported_uptime, total_uptime));
+                                Some((current_time as i64, reported_uptime, total_uptime));
                             continue;
                         }
                         // 2. The difference in uptime is within reason of the difference in
@@ -554,7 +554,7 @@ async fn main() {
                                 // Make sure we don't add too much based on the period.
                                 total_uptime += delta_in_period as u64;
                                 node.uptime_info =
-                                    Some((*current_time as i64, *reported_uptime, total_uptime));
+                                    Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
                             }
                         }
@@ -564,22 +564,22 @@ async fn main() {
                         //    an uptime which is too high.
                         //
                         //    1. Uptime is within bounds.
-                        if *reported_uptime as i64 <= report_delta {
+                        if reported_uptime as i64 <= report_delta {
                             // Account for the fact that we are actually out of the period
-                            let out_of_period = *current_time - end_ts as u64;
-                            if out_of_period < *reported_uptime {
-                                total_uptime += *reported_uptime - out_of_period;
+                            let out_of_period = current_time - end_ts as u64;
+                            if out_of_period < reported_uptime {
+                                total_uptime += reported_uptime - out_of_period;
                             }
                             node.uptime_info =
-                                Some((*current_time as i64, *reported_uptime, total_uptime));
+                                Some((current_time as i64, reported_uptime, total_uptime));
                             continue;
                         }
                         //    2. Uptime is higher than previously recorded uptime but too low.
                         //    This might be a result off network congestion.
-                        if *reported_uptime > last_reported_uptime {
+                        if reported_uptime > last_reported_uptime {
                             total_uptime += uptime_delta as u64;
                             node.uptime_info =
-                                Some((*current_time as i64, *reported_uptime, total_uptime));
+                                Some((current_time as i64, reported_uptime, total_uptime));
                             continue;
                         }
                         //    3. Uptime is too high, this is garbage
