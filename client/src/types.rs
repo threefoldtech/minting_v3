@@ -237,13 +237,13 @@ pub struct NruConsumption {
     pub nru: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum PowerState {
     Up,
     Down(u32),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Power {
     Up,
     Down,

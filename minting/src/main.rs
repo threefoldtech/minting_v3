@@ -20,7 +20,7 @@ use tfchain_client::{
     client::{height_at_timestamp, RuntimeClient},
     types::{
         Contract as ChainContract, ContractData, ContractResources, Farm, FarmPolicy, Location,
-        Node, NodeCertification, Resources, RuntimeEvents,
+        Node, NodeCertification, NodePower, Power, PowerState, Resources, RuntimeEvents,
     },
 };
 
@@ -29,7 +29,7 @@ mod receipt;
 mod stellar;
 mod types;
 
-const RPC_THREADS: usize = 10;
+const RPC_THREADS: usize = 24;
 const PRE_FETCH: usize = 5;
 const UPTIME_GRACE_PERIOD_SECONDS: i64 = 300; // 5 Minutes
 const GIB: u128 = 1024 * 1024 * 1024;
@@ -56,6 +56,9 @@ const CARBON_CREDIT_ADDRESS: &str = "GDIJY6K2BBRIRX423ZFUYKKFDN66XP2KMSBZFQSE2PS
 /// Address of horizon server to use
 //const HORIZON_URL: &str = "https://stellar-mainnet.grid.tf";
 const HORIZON_URL: &str = "https://horizon.stellar.org";
+/// Maximum amount of seconds a node can be offline because of the power managment feature while
+/// still getting rewards.
+const MAX_POWER_MANAGER_DOWNTIME: u64 = 60 * 60 * 25;
 
 #[tokio::main]
 async fn main() {
@@ -179,11 +182,44 @@ async fn main() {
                     capacity_consumption: TotalConsumption::default(),
                     virtualized: node.virtualized,
                     farming_policy_id: node.farming_policy_id,
+                    power_managed: None,
                 },
             )
         })
         .collect();
     println!("Found {} existing nodes", nodes.len());
+
+    let mut power_states: BTreeMap<_, _> = get_power_states(&client, start_block)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    println!("Found {} power states", power_states.len());
+
+    // Insert missing entries for power state, and update node power managed if it currently is
+    // power managed.
+    for (node_id, node) in nodes.iter_mut() {
+        match power_states.get(&node_id) {
+            None => {
+                power_states.insert(
+                    *node_id,
+                    NodePower {
+                        state: PowerState::Up,
+                        target: Power::Up,
+                    },
+                );
+            }
+            Some(NodePower {
+                state: PowerState::Down(block),
+                target: _,
+            }) => {
+                let hash = client.hash_at_height(Some(*block)).await.unwrap();
+                let ts = client.timestamp(hash).await.unwrap() / 1000;
+                node.power_managed = Some(ts as i64);
+            }
+            _ => {}
+        }
+    }
 
     // Load farms at the end of the period. This means we don't have to parse individual farm
     // events, as we can just fetch the last known state.
@@ -273,6 +309,14 @@ async fn main() {
                             capacity_consumption: TotalConsumption::default(),
                             virtualized: node.virtualized,
                             farming_policy_id: node.farming_policy_id,
+                            power_managed: None,
+                        },
+                    );
+                    power_states.insert(
+                        node.id,
+                        NodePower {
+                            state: PowerState::Up,
+                            target: Power::Up,
                         },
                     );
                 }
@@ -327,79 +371,112 @@ async fn main() {
                             id, height
                         ),
                     };
-                    if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
-                        node.uptime_info
-                    {
-                        let report_delta = current_time as i64 - last_reported_at;
-                        let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
-                        // There are quite some situations here. Notice that due to the
-                        // blockchain only producing blocks every 6 seconds, and network delay
-                        // + a host of other issues, we will allow a node to report uptime with
-                        // "grace period" of a couple of minutes or so in either direction.
-                        //
-                        // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
-                        //    rubish.
-                        if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                            // This is possible if a node lags when sending uptime (extrinsic
-                            // takes a while to be accepted). Manual data validation found no
-                            // issues (i.e. all incidents of this type were a result of the
-                            // above). This should be changed in the future.
-                            total_uptime += uptime_delta as u64;
+                    if let Some(time_set_down) = node.power_managed {
+                        // Ignore the event if it is sent after the node is supposed to go down,
+                        // this will be accounted for once the node starts up again.
+                        // For the node to have been properly power managed, it must be booted
+                        // after it was set to down.
+                        if (current_time - reported_uptime) as i64 > time_set_down {
+                            // node got power managed to down
+                            let time_delta = current_time as i64 - time_set_down;
+                            assert!(time_delta >= 0, "uptime events can't travel back in time");
+                            let mut total_uptime =
+                                if let Some((_, _, total_uptime)) = node.uptime_info {
+                                    total_uptime
+                                } else {
+                                    0
+                                };
+                            // Only add uptime if node came back online in time.
+                            if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
+                                // Check and scale to match the actual period start if needed
+                                if time_set_down < start_ts {
+                                    total_uptime += (current_time as i64 - start_ts) as u64;
+                                } else {
+                                    total_uptime += time_delta as u64;
+                                }
+                            }
+                            // Clear the fact that we got power managed, if it is still the case, it
+                            // will be set again in the proper event handler.
+                            node.power_managed = None;
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, total_uptime));
-                            continue;
                         }
-                        // 2. The difference in uptime is within reason of the difference in
-                        //    report times, i.e. the node is properly reporting.
-                        if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
-                            && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+                    } else {
+                        if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
+                            node.uptime_info
                         {
-                            // It is technically possible for the delta to be less than 0 and
-                            // within the expected time frame. If nodes boot, send uptime, then
-                            // immediately reboot that is possible. In those cases, handle that
-                            // below, as that is the reboot detection.
-                            if uptime_delta > 0 {
-                                // Simply add the uptime delta. If this is too large or low by a
-                                // couple of seconds it will be corrected by the next pings anyhow.
+                            let report_delta = current_time as i64 - last_reported_at;
+                            let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
+                            // There are quite some situations here. Notice that due to the
+                            // blockchain only producing blocks every 6 seconds, and network delay
+                            // + a host of other issues, we will allow a node to report uptime with
+                            // "grace period" of a couple of minutes or so in either direction.
+                            //
+                            // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
+                            //    rubish.
+                            if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
+                                // This is possible if a node lags when sending uptime (extrinsic
+                                // takes a while to be accepted). Manual data validation found no
+                                // issues (i.e. all incidents of this type were a result of the
+                                // above). This should be changed in the future.
                                 total_uptime += uptime_delta as u64;
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
                             }
-                        }
-                        // 3. The difference in uptime is too low. Again there are multiple
-                        //    scenarios. Either way we consider the node rebooted. Depending on
-                        //    the reported uptime, the node reports legit uptime, or it reports
-                        //    an uptime which is too high.
-                        //
-                        //    1. Uptime is within bounds.
-                        if reported_uptime as i64 <= report_delta {
-                            total_uptime += reported_uptime;
-                            node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
+                            // 2. The difference in uptime is within reason of the difference in
+                            //    report times, i.e. the node is properly reporting.
+                            if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
+                                && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+                            {
+                                // It is technically possible for the delta to be less than 0 and
+                                // within the expected time frame. If nodes boot, send uptime, then
+                                // immediately reboot that is possible. In those cases, handle that
+                                // below, as that is the reboot detection.
+                                if uptime_delta > 0 {
+                                    // Simply add the uptime delta. If this is too large or low by a
+                                    // couple of seconds it will be corrected by the next pings anyhow.
+                                    total_uptime += uptime_delta as u64;
+                                    node.uptime_info =
+                                        Some((current_time as i64, reported_uptime, total_uptime));
+                                    continue;
+                                }
+                            }
+                            // 3. The difference in uptime is too low. Again there are multiple
+                            //    scenarios. Either way we consider the node rebooted. Depending on
+                            //    the reported uptime, the node reports legit uptime, or it reports
+                            //    an uptime which is too high.
+                            //
+                            //    1. Uptime is within bounds.
+                            if reported_uptime as i64 <= report_delta {
+                                total_uptime += reported_uptime;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                continue;
+                            }
+                            //    2. Uptime is higher than previously recorded uptime but too low.
+                            //    This might be a result off network congestion.
+                            if reported_uptime > last_reported_uptime {
+                                total_uptime += uptime_delta as u64;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                continue;
+                            }
+                            //    3. Uptime is too high, this is garbage
+                            if node.first_uptime_violation.is_none() {
+                                node.first_uptime_violation = Some((last_reported_at, height));
+                            }
                             continue;
-                        }
-                        //    2. Uptime is higher than previously recorded uptime but too low.
-                        //    This might be a result off network congestion.
-                        if reported_uptime > last_reported_uptime {
-                            total_uptime += uptime_delta as u64;
+                        } else {
+                            let period_duration = current_time as i64 - start_ts;
+                            // Make sure we don't give more credit than the current length of the
+                            // period.
+                            let up_in_period =
+                                std::cmp::min(period_duration as u64, reported_uptime);
+                            // Save uptime info
                             node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
-                            continue;
+                                Some((current_time as i64, reported_uptime, up_in_period));
                         }
-                        //    3. Uptime is too high, this is garbage
-                        if node.first_uptime_violation.is_none() {
-                            node.first_uptime_violation = Some((last_reported_at, height));
-                        }
-                        continue;
-                    } else {
-                        let period_duration = current_time as i64 - start_ts;
-                        // Make sure we don't give more credit than the current length of the
-                        // period.
-                        let up_in_period = std::cmp::min(period_duration as u64, reported_uptime);
-                        // Save uptime info
-                        node.uptime_info =
-                            Some((current_time as i64, reported_uptime, up_in_period));
                     }
                 }
                 RuntimeEvents::ContractUsedResourcesUpdated(data) => {
@@ -474,6 +551,69 @@ async fn main() {
                         );
                     };
                 }
+                RuntimeEvents::PowerTargetChanged(ptc) => {
+                    let node_power = match power_states.get_mut(&ptc.node_id) {
+                        Some(ps) => ps,
+                        None => panic!(
+                            "can't change power target for unknown node {} in block {}",
+                            ptc.node_id, height
+                        ),
+                    };
+                    node_power.target = ptc.power_target;
+                }
+                RuntimeEvents::PowerStateChanged(psc) => {
+                    let node_power = match power_states.get_mut(&psc.node_id) {
+                        Some(ps) => ps,
+                        None => panic!(
+                            "can't change power target for unknown node {} in block {}",
+                            psc.node_id, height
+                        ),
+                    };
+                    // Add exception to allow node 1 uptime ping once it gets back on which
+                    // indicates a reboot.
+                    // Also, we only allow this if the target is down as well.
+                    if node_power.target == Power::Down {
+                        // Only on state transition
+                        if node_power.state == PowerState::Up
+                            && matches!(psc.power_state, PowerState::Down(_))
+                        {
+                            // Keep track of this timestamp
+                            let node = match nodes.get_mut(&psc.node_id) {
+                                Some(node) => node,
+                                None => {
+                                    panic!("Node must be registered if its power target changes")
+                                }
+                            };
+                            // Either this is Some(timestamp), indicating a previous state
+                            // transition which was not followed by an uptime ping once the node
+                            // came online. In this case, we ignore that here. This would mean the
+                            // node did not come up again.
+                            // Otherwise, if None, set the current timestamp as time of going down.
+                            if node.power_managed.is_none() {
+                                // Also add an implicit uptime.
+                                node.power_managed = Some(ts);
+                                // While we are at it, credit uptime since last uptime event as
+                                // well, as we will use this timestamp as the base for future
+                                // uptime calculations.
+                                // We don't have to overwrite this since future calculations will
+                                // first work on the saved power_managed variable, and will have a
+                                // reboot either way.
+                                if let Some((last_reported_at, _, mut total_uptime)) =
+                                    node.uptime_info
+                                {
+                                    let delta = ts - last_reported_at;
+                                    assert!(
+                                        delta >= 0,
+                                        "Power state changes can't travel back in time"
+                                    );
+                                    total_uptime += delta as u64;
+                                    // We can set uptime to 0, node will reboot anyway.
+                                    node.uptime_info = Some((ts, 0, total_uptime));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -491,7 +631,7 @@ async fn main() {
     bar.finish();
 
     println!("Getting uptime info from post period");
-    let bar = ProgressBar::new(BLOCKS_IN_HOUR as u64 * 2);
+    let bar = ProgressBar::new(BLOCKS_IN_HOUR as u64 * 27);
     bar.set_style(
         ProgressStyle::default_bar()
             .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
@@ -499,10 +639,21 @@ async fn main() {
 
     // Collect post-period uptime events. Violations don't matter here, those will be handled next
     // period.
+    let mut import_queue = block_import(
+        &wss_url,
+        height as usize,
+        end_block as usize + BLOCKS_IN_HOUR as usize * 27,
+    )
+    .await;
     loop {
-        let hash = client.hash_at_height(Some(height)).await.unwrap();
-        let evts = client.events(hash).await.unwrap();
-        let ts = client.timestamp(hash).await.unwrap() / 1000;
+        let (ts, evts) = if let Some((ts, evts)) = import_queue.recv().await {
+            (ts, evts)
+        } else {
+            panic!("Block import exitted too early");
+        };
+        // let hash = client.hash_at_height(Some(height)).await.unwrap();
+        // let evts = client.events(hash).await.unwrap();
+        // let ts = client.timestamp(hash).await.unwrap() / 1000;
         for evt in evts.into_iter() {
             match evt {
                 RuntimeEvents::NodeUptimeReported(id, current_time, reported_uptime) => {
@@ -512,83 +663,115 @@ async fn main() {
                         // the period ended
                         None => continue,
                     };
-                    if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
-                        node.uptime_info
-                    {
-                        // only collect 1 uptime event after the period ended
-                        if last_reported_at >= end_ts {
-                            continue;
-                        }
-                        let report_delta = current_time as i64 - last_reported_at;
-                        let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
-                        let delta_in_period = end_ts - last_reported_at;
-                        // There are quite some situations here. Notice that due to the
-                        // blockchain only producing blocks every 6 seconds, and network delay
-                        // + a host of other issues, we will allow a node to report uptime with
-                        // "grace period" of a minute or so in either direction.
-                        //
-                        // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
-                        //    rubish.
-                        if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                            // This will actually be picked up next period as a violation if we
-                            // care for that.
-                            total_uptime += delta_in_period as u64;
-                            node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
-                            continue;
-                        }
-                        // 2. The difference in uptime is within reason of the difference in
-                        //    report times, i.e. the node is properly reporting.
-                        if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
-                            && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+
+                    if let Some(time_set_down) = node.power_managed {
+                        // node got power managed to down
+                        let time_delta = current_time as i64 - time_set_down;
+                        assert!(time_delta >= 0, "uptime events can't travel back in time");
+                        let mut total_uptime = if let Some((last_reported_at, _, total_uptime)) =
+                            node.uptime_info
                         {
-                            // It is technically possible for the delta to be less than 0 and
-                            // within the expected time frame. If nodes boot, send uptime, then
-                            // immediately reboot that is possible. In those cases, handle that
-                            // below, as that is the reboot detection.
-                            if uptime_delta > 0 {
-                                // Simply add the uptime delta. If this is too large or low by a
-                                // couple of seconds it will be corrected by the next pings anyhow.
-                                //
-                                // Make sure we don't add too much based on the period.
+                            assert!(
+                                    last_reported_at < end_ts,
+                                    "there can only be 1 uptime event post period for a power managed node"
+                                );
+                            total_uptime
+                        } else {
+                            0
+                        };
+                        // Only add uptime if node came back online in time.
+                        if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
+                            let uptime_diff = end_ts - i64::max(start_ts, time_set_down);
+                            assert!(
+                                uptime_diff >= 0,
+                                "uptime event must be sent after node wen't down, chronology"
+                            );
+                            total_uptime += uptime_diff as u64;
+                        }
+                        // Clear the fact that we got power managed, if it is still the case, it
+                        // will be set again in the proper event handler.
+                        node.power_managed = None;
+                        node.uptime_info =
+                            Some((current_time as i64, reported_uptime, total_uptime));
+                    } else {
+                        if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
+                            node.uptime_info
+                        {
+                            // only collect 1 uptime event after the period ended
+                            if last_reported_at >= end_ts {
+                                continue;
+                            }
+                            let report_delta = current_time as i64 - last_reported_at;
+                            let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
+                            let delta_in_period = end_ts - last_reported_at;
+                            // There are quite some situations here. Notice that due to the
+                            // blockchain only producing blocks every 6 seconds, and network delay
+                            // + a host of other issues, we will allow a node to report uptime with
+                            // "grace period" of a minute or so in either direction.
+                            //
+                            // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
+                            //    rubish.
+                            if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
+                                // This will actually be picked up next period as a violation if we
+                                // care for that.
                                 total_uptime += delta_in_period as u64;
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
                             }
-                        }
-                        // 3. The difference in uptime is too low. Again there are multiple
-                        //    scenarios. Either way we consider the node rebooted. Depending on
-                        //    the reported uptime, the node reports legit uptime, or it reports
-                        //    an uptime which is too high.
-                        //
-                        //    1. Uptime is within bounds.
-                        if reported_uptime as i64 <= report_delta {
-                            // Account for the fact that we are actually out of the period
-                            let out_of_period = current_time - end_ts as u64;
-                            if out_of_period < reported_uptime {
-                                total_uptime += reported_uptime - out_of_period;
+                            // 2. The difference in uptime is within reason of the difference in
+                            //    report times, i.e. the node is properly reporting.
+                            if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
+                                && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+                            {
+                                // It is technically possible for the delta to be less than 0 and
+                                // within the expected time frame. If nodes boot, send uptime, then
+                                // immediately reboot that is possible. In those cases, handle that
+                                // below, as that is the reboot detection.
+                                if uptime_delta > 0 {
+                                    // Simply add the uptime delta. If this is too large or low by a
+                                    // couple of seconds it will be corrected by the next pings anyhow.
+                                    //
+                                    // Make sure we don't add too much based on the period.
+                                    total_uptime += delta_in_period as u64;
+                                    node.uptime_info =
+                                        Some((current_time as i64, reported_uptime, total_uptime));
+                                    continue;
+                                }
                             }
-                            node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
-                            continue;
-                        }
-                        //    2. Uptime is higher than previously recorded uptime but too low.
-                        //    This might be a result off network congestion.
-                        if reported_uptime > last_reported_uptime {
-                            total_uptime += uptime_delta as u64;
-                            node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
-                            continue;
-                        }
-                        //    3. Uptime is too high, this is garbage
-                        if node.first_uptime_violation.is_none() {
-                            node.first_uptime_violation = Some((last_reported_at, height));
-                            continue;
-                        }
+                            // 3. The difference in uptime is too low. Again there are multiple
+                            //    scenarios. Either way we consider the node rebooted. Depending on
+                            //    the reported uptime, the node reports legit uptime, or it reports
+                            //    an uptime which is too high.
+                            //
+                            //    1. Uptime is within bounds.
+                            if reported_uptime as i64 <= report_delta {
+                                // Account for the fact that we are actually out of the period
+                                let out_of_period = current_time - end_ts as u64;
+                                if out_of_period < reported_uptime {
+                                    total_uptime += reported_uptime - out_of_period;
+                                }
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                continue;
+                            }
+                            //    2. Uptime is higher than previously recorded uptime but too low.
+                            //    This might be a result off network congestion.
+                            if reported_uptime > last_reported_uptime {
+                                total_uptime += uptime_delta as u64;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                continue;
+                            }
+                            //    3. Uptime is too high, this is garbage
+                            if node.first_uptime_violation.is_none() {
+                                node.first_uptime_violation = Some((last_reported_at, height));
+                                continue;
+                            }
 
-                        // We should have handled all cases. Make this explicit here.
-                        unreachable!();
+                            // We should have handled all cases. Make this explicit here.
+                            unreachable!();
+                        }
                     }
                 }
                 _ => {
@@ -603,7 +786,7 @@ async fn main() {
 
         height += 1;
 
-        if height > end_block + BLOCKS_IN_HOUR * 2 {
+        if height > end_block + BLOCKS_IN_HOUR * 27 {
             break;
         }
     }
@@ -880,6 +1063,8 @@ struct MintingNode {
     capacity_consumption: TotalConsumption,
     virtualized: bool,
     farming_policy_id: u32,
+    // Timestamp the node changed powerstate to down, before a new uptime was posted.
+    power_managed: Option<i64>,
 }
 
 impl MintingNode {
@@ -1117,7 +1302,17 @@ impl MintingNode {
             }
 
             // Scale payouts for now, remember to divide by the upscale.
-            if self.farming_policy_id == 1 || self.farming_policy_id == 2 {
+            if self.farming_policy_id == 1
+                || self.farming_policy_id == 2
+                    // Convoluted check because new nodes on testnet seem to get farming policy 3,
+                    // without having to add explicit network selectors.
+                || (self.farming_policy_id == 3
+                    && if let Some(policy) = farming_policies.get(&3) {
+                        !policy.default && !policy.immutable && policy.minimal_uptime == 95
+                    } else {
+                        false
+                    })
+            {
                 (
                     self.node_payout_musd(farming_policies) * uptime_percentage / 1_000,
                     self.node_payout_tft_units(farming_policies) * uptime_percentage / 1_000,
@@ -1266,6 +1461,21 @@ pub async fn get_farming_policies(
     Ok(policies)
 }
 
+pub async fn get_power_states(
+    client: &dyn RuntimeClient,
+    block: u32,
+) -> Result<Vec<(u32, NodePower)>, Box<dyn std::error::Error>> {
+    let hash = client.hash_at_height(Some(block)).await?;
+    let node_count = client.node_count(hash).await?;
+    let mut power_states = Vec::new();
+    for i in 1..=node_count {
+        if let Some(ps) = client.node_power(i, hash).await? {
+            power_states.push((i, ps));
+        }
+    }
+    Ok(power_states)
+}
+
 async fn block_import(
     wss_url: &str,
     start: usize,
@@ -1274,7 +1484,7 @@ async fn block_import(
     let mut t_rec = Vec::with_capacity(RPC_THREADS);
     for i in 0..RPC_THREADS {
         let client = DynamicClient::new(&wss_url).await.unwrap();
-        let (tx, rx) = mpsc::channel(5);
+        let (tx, rx) = mpsc::channel(PRE_FETCH);
         let mut height = start + i;
         tokio::task::spawn(async move {
             loop {
