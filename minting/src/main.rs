@@ -31,7 +31,7 @@ mod types;
 
 const RPC_THREADS: usize = 24;
 const PRE_FETCH: usize = 5;
-const UPTIME_GRACE_PERIOD_SECONDS: i64 = 300; // 5 Minutes
+const UPTIME_GRACE_PERIOD_SECONDS: i64 = 60; // 1 Minute
 const GIB: u128 = 1024 * 1024 * 1024;
 const ONE_MILL: u128 = 1_000_000;
 /// The amount of "units" that make 1 TFT.
@@ -454,14 +454,6 @@ async fn main() {
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
                             }
-                            //    2. Uptime is higher than previously recorded uptime but too low.
-                            //    This might be a result off network congestion.
-                            if reported_uptime > last_reported_uptime {
-                                total_uptime += uptime_delta as u64;
-                                node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
-                                continue;
-                            }
                             //    3. Uptime is too high, this is garbage
                             if node.first_uptime_violation.is_none() {
                                 node.first_uptime_violation = Some((last_reported_at, height));
@@ -751,14 +743,6 @@ async fn main() {
                                 if out_of_period < reported_uptime {
                                     total_uptime += reported_uptime - out_of_period;
                                 }
-                                node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
-                                continue;
-                            }
-                            //    2. Uptime is higher than previously recorded uptime but too low.
-                            //    This might be a result off network congestion.
-                            if reported_uptime > last_reported_uptime {
-                                total_uptime += uptime_delta as u64;
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
