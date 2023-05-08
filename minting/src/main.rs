@@ -30,6 +30,41 @@ mod types;
 
 const RPC_THREADS: usize = 24;
 const PRE_FETCH: usize = 5;
+/// Currently on TFchain, the weight limit of a block is `2_000_000_000_000`. The vast majority of
+/// calls are `UptimeReported` calls and `billContractForBlock` calls. The former has an associated
+/// weight of `446_058_000`, while the latter has an associated weight of `780_660_000`. Given that
+/// a node sends an uptime report every 40 minutes, the expected amount of uptime reports is (nr
+/// nodes * 1.5) per hour, while the expected billContractForBlock call amount per hour is simply
+/// nr contracts. Additionally, as part of billing we also have `addNruReports`, which is called
+/// once per hour for every contract (technically nodes with contracts call this once per hour and
+/// it contains multiple contracts, but the weight scales roughly linearly with the amount of
+/// contracts). The weight of one call is `473_727_000`. For calculating the density of these
+/// calls, we assume all nodes are up. This gives about 5500 nodes. We also assume 750 contracts
+/// (values are taken at the time of writing).
+///
+/// Since uptime reporting depends on boot time, and contract billing depends on contract creation
+/// time, we can use the law of large numbers to model these events as evenly distributed across
+/// the available blocks. With a block time of 6 seconds, there are assumed to be 600 blocks per
+/// hour for a fully functioning chain. Additionally, if a block is missed, the calls for that
+/// block will be added to the next block, recursively, until a block is created. This means that,
+/// a block contains all calls for itself and all previously missed blocks.
+///
+/// For a fully functioning chain, the used weight is 5500/600*780_660_000 +
+/// 750/600*(446_058_000+473_727_000). This amounts to 7_156_050_000 + 1_149_731_250 =
+/// 8_305_892_250. Considering the previously established block allowed weight of 2E12, that equals
+/// to an average of 0.415% of a block. Even if we are pessimistic and assume the actual weight of
+/// calls should be double, AND the chain increases 10 times in size of both nodes and contracts,
+/// we are only at 8.30% weight, which should not be a problem at all. Considering there are 10
+/// block creators, this means we could loose all of them but one and still not have a problem for
+/// nodes to push uptimes (note the chain requires more than 2/3 i.e. at least 7 block creators
+/// before finalization stalled, so we can assume at most 3 nodes are down at once).
+///
+/// Considering these constraints, and the invariant that nodes send an uptime report every 40
+/// minutes, 1 minute is a sufficiently large grace period: this allows for nodes to _still_ get
+/// their uptime reports in the chain even if all nodes on the chain are down except one (which as
+/// discussed above is a critical chain situation).
+///
+/// Numbers are accurate as of 2023-05-08.
 const UPTIME_GRACE_PERIOD_SECONDS: i64 = 60; // 1 Minute
 const GIB: u128 = 1024 * 1024 * 1024;
 const ONE_MILL: u128 = 1_000_000;
