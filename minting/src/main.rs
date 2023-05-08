@@ -1,4 +1,4 @@
-use crate::period::Period;
+use crate::{period::Period, violation::Violation};
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use chrono::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -27,6 +27,7 @@ mod period;
 mod receipt;
 mod stellar;
 mod types;
+mod violation;
 
 const RPC_THREADS: usize = 24;
 const PRE_FETCH: usize = 5;
@@ -208,7 +209,7 @@ async fn main() {
                     _created: node.created,
                     certification_type: node.certification,
                     uptime_info: None,
-                    first_uptime_violation: None,
+                    violation: Violation::None,
                     connected: NodeConnected::Old,
                     connection_price: node.connection_price,
                     capacity_consumption: TotalConsumption::default(),
@@ -334,7 +335,7 @@ async fn main() {
                             _created: node.created,
                             certification_type: node.certification.clone(),
                             uptime_info: None,
-                            first_uptime_violation: None,
+                            violation: Violation::None,
                             connected: NodeConnected::Current(ts as i64),
                             connection_price: node.connection_price,
                             capacity_consumption: TotalConsumption::default(),
@@ -486,8 +487,14 @@ async fn main() {
                                 continue;
                             }
                             //    3. Uptime is too high, this is garbage
-                            if node.first_uptime_violation.is_none() {
-                                node.first_uptime_violation = Some((last_reported_at, height));
+                            if node.violation.is_none() {
+                                node.violation = Violation::InvalidReboot {
+                                    previous_uptime: last_reported_uptime,
+                                    previous_timestamp: last_reported_at,
+                                    reported_uptime,
+                                    reported_timestamp: ts,
+                                    block_reported: height,
+                                }
                             }
                             continue;
                         } else {
@@ -779,8 +786,14 @@ async fn main() {
                                 continue;
                             }
                             //    3. Uptime is too high, this is garbage
-                            if node.first_uptime_violation.is_none() {
-                                node.first_uptime_violation = Some((last_reported_at, height));
+                            if node.violation.is_none() {
+                                node.violation = Violation::InvalidReboot {
+                                    previous_uptime: last_reported_uptime,
+                                    previous_timestamp: last_reported_at,
+                                    reported_uptime,
+                                    reported_timestamp: ts,
+                                    block_reported: height,
+                                };
                                 continue;
                             }
 
@@ -877,11 +890,7 @@ async fn main() {
                 "DIY"
             },
             node.virtualized,
-            if let Some((lra, violation)) = node.first_uptime_violation {
-                format!("violation of uptime measurement in block {} (previous report {})", violation, lra)
-            } else {
-                "".into()
-            },
+            node.violation,
             stellar_address,
         ).unwrap();
 
@@ -1068,8 +1077,7 @@ struct MintingNode {
     certification_type: NodeCertification,
     // (last ping, last reported uptime, total uptime).
     uptime_info: Option<(i64, u64, u64)>,
-    // Block where the first uptime report violation was detected, if any.
-    first_uptime_violation: Option<(i64, u32)>,
+    violation: Violation,
     connected: NodeConnected,
     // TFT price expressed in USD at time of connection. Price is expressed in mUSD (3 digits
     // precision). I.e. 1 USD => 1000.
@@ -1129,7 +1137,7 @@ impl MintingNode {
     ///
     /// A virtualized node (i.e. zos running in VM) won't get anything.
     fn node_payout_musd(&self, farming_policies: &BTreeMap<u32, FarmPolicy>) -> u64 {
-        if self.virtualized || self.first_uptime_violation.is_some() {
+        if self.virtualized || self.violation.is_some() {
             return 0;
         }
         let policy = farming_policies.get(&self.farming_policy_id).unwrap();
@@ -1166,7 +1174,7 @@ impl MintingNode {
     ///
     /// A virtualized node is garbage so that does not receive anything.
     fn node_carbon_musd(&self) -> u64 {
-        if self.virtualized || self.first_uptime_violation.is_some() {
+        if self.virtualized || self.violation.is_some() {
             return 0;
         }
         let (cu, su, _) = self.cloud_units_permill();
