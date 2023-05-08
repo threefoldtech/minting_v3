@@ -67,6 +67,7 @@ const PRE_FETCH: usize = 5;
 ///
 /// Numbers are accurate as of 2023-05-08.
 const UPTIME_GRACE_PERIOD_SECONDS: i64 = 60; // 1 Minute
+const NODE_UPTIME_REPORT_INTERVAL_SECONDS: i64 = 60 * 40; // 40 minutes
 const GIB: u128 = 1024 * 1024 * 1024;
 const ONE_MILL: u128 = 1_000_000;
 /// The amount of "units" that make 1 TFT.
@@ -472,7 +473,15 @@ async fn main() {
                                 if uptime_delta > 0 {
                                     // Simply add the uptime delta. If this is too large or low by a
                                     // couple of seconds it will be corrected by the next pings anyhow.
-                                    total_uptime += uptime_delta as u64;
+                                    // That being said, we also limit the amount of uptime credit
+                                    // to the uptime report interval + grace period, as healthy
+                                    // nodes _must_ ping every interval amount of time
+                                    total_uptime += u64::max(
+                                        uptime_delta as u64,
+                                        (NODE_UPTIME_REPORT_INTERVAL_SECONDS
+                                            + UPTIME_GRACE_PERIOD_SECONDS)
+                                            as u64,
+                                    );
                                     node.uptime_info =
                                         Some((current_time as i64, reported_uptime, total_uptime));
                                     continue;
@@ -485,7 +494,12 @@ async fn main() {
                             //
                             //    1. Uptime is within bounds.
                             if reported_uptime as i64 <= report_delta {
-                                total_uptime += reported_uptime;
+                                total_uptime += u64::max(
+                                    reported_uptime,
+                                    (NODE_UPTIME_REPORT_INTERVAL_SECONDS
+                                        + UPTIME_GRACE_PERIOD_SECONDS)
+                                        as u64,
+                                );
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
@@ -522,8 +536,12 @@ async fn main() {
                             let period_duration = current_time as i64 - start_ts;
                             // Make sure we don't give more credit than the current length of the
                             // period.
-                            let up_in_period =
-                                std::cmp::min(period_duration as u64, reported_uptime);
+                            // Account for uptime period
+                            let up_in_period = u64::max(
+                                std::cmp::min(period_duration as u64, reported_uptime),
+                                (NODE_UPTIME_REPORT_INTERVAL_SECONDS + UPTIME_GRACE_PERIOD_SECONDS)
+                                    as u64,
+                            );
                             // Save uptime info
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, up_in_period));
@@ -793,7 +811,12 @@ async fn main() {
                                     // couple of seconds it will be corrected by the next pings anyhow.
                                     //
                                     // Make sure we don't add too much based on the period.
-                                    total_uptime += delta_in_period as u64;
+                                    total_uptime += u64::max(
+                                        delta_in_period as u64,
+                                        (NODE_UPTIME_REPORT_INTERVAL_SECONDS
+                                            + UPTIME_GRACE_PERIOD_SECONDS)
+                                            as u64,
+                                    );
                                     node.uptime_info =
                                         Some((current_time as i64, reported_uptime, total_uptime));
                                     continue;
@@ -809,7 +832,12 @@ async fn main() {
                                 // Account for the fact that we are actually out of the period
                                 let out_of_period = current_time - end_ts as u64;
                                 if out_of_period < reported_uptime {
-                                    total_uptime += reported_uptime - out_of_period;
+                                    total_uptime += u64::max(
+                                        reported_uptime - out_of_period,
+                                        (NODE_UPTIME_REPORT_INTERVAL_SECONDS
+                                            + UPTIME_GRACE_PERIOD_SECONDS)
+                                            as u64,
+                                    );
                                 }
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
