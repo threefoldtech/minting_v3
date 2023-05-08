@@ -447,11 +447,15 @@ async fn main() {
                             // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
                             //    rubish.
                             if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                                // This is possible if a node lags when sending uptime (extrinsic
-                                // takes a while to be accepted). Manual data validation found no
-                                // issues (i.e. all incidents of this type were a result of the
-                                // above). This should be changed in the future.
-                                total_uptime += uptime_delta as u64;
+                                if node.violation.is_none() {
+                                    node.violation = Violation::UptimeTooHigh {
+                                        previous_uptime: last_reported_uptime,
+                                        previous_timestamp: last_reported_at,
+                                        reported_uptime,
+                                        reported_timestamp: ts,
+                                        block_reported: height,
+                                    };
+                                }
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
@@ -484,6 +488,23 @@ async fn main() {
                                 total_uptime += reported_uptime;
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
+                                continue;
+                            }
+                            //    2. Uptime is actually higher than difference in timestamp, but
+                            //       not high enough to be valid. This means the node was
+                            //       supposedly rebooted _before_ the previous uptime report,
+                            //       meaning either that report is invalid or this report is
+                            //       invalid.
+                            if reported_uptime > last_reported_uptime {
+                                if node.violation.is_none() {
+                                    node.violation = Violation::UptimeTooLow {
+                                        previous_uptime: last_reported_uptime,
+                                        previous_timestamp: last_reported_at,
+                                        reported_uptime,
+                                        reported_timestamp: ts,
+                                        block_reported: height,
+                                    };
+                                }
                                 continue;
                             }
                             //    3. Uptime is too high, this is garbage
@@ -742,9 +763,18 @@ async fn main() {
                             // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
                             //    rubish.
                             if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                                // This will actually be picked up next period as a violation if we
-                                // care for that.
-                                total_uptime += delta_in_period as u64;
+                                // We need to register the violation here as we won't be able to
+                                // next period (since we don't scrape points from before the period
+                                // atm).
+                                if node.violation.is_none() {
+                                    node.violation = Violation::UptimeTooHigh {
+                                        previous_uptime: last_reported_uptime,
+                                        previous_timestamp: last_reported_at,
+                                        reported_uptime,
+                                        reported_timestamp: ts,
+                                        block_reported: height,
+                                    };
+                                }
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
@@ -785,6 +815,23 @@ async fn main() {
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
                             }
+                            //    2. Uptime is actually higher than difference in timestamp, but
+                            //       not high enough to be valid. This means the node was
+                            //       supposedly rebooted _before_ the previous uptime report,
+                            //       meaning either that report is invalid or this report is
+                            //       invalid.
+                            if reported_uptime > last_reported_uptime {
+                                if node.violation.is_none() {
+                                    node.violation = Violation::UptimeTooLow {
+                                        previous_uptime: last_reported_uptime,
+                                        previous_timestamp: last_reported_at,
+                                        reported_uptime,
+                                        reported_timestamp: ts,
+                                        block_reported: height,
+                                    };
+                                }
+                                continue;
+                            }
                             //    3. Uptime is too high, this is garbage
                             if node.violation.is_none() {
                                 node.violation = Violation::InvalidReboot {
@@ -808,7 +855,6 @@ async fn main() {
             }
         }
 
-        //bar.set_message(format!("{}/7200", height - end_block,));
         bar.set_message(Utc.timestamp(ts as i64, 0).to_rfc2822());
         bar.inc(1);
 
