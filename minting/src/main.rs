@@ -58,7 +58,7 @@ const CARBON_CREDIT_ADDRESS: &str = "GDIJY6K2BBRIRX423ZFUYKKFDN66XP2KMSBZFQSE2PS
 const HORIZON_URL: &str = "https://horizon.stellar.org";
 /// Maximum amount of seconds a node can be offline because of the power managment feature while
 /// still getting rewards.
-const MAX_POWER_MANAGER_DOWNTIME: u64 = 60 * 60 * 25;
+const MAX_POWER_MANAGER_DOWNTIME: u64 = 60 * 60 * 24;
 
 #[tokio::main]
 async fn main() {
