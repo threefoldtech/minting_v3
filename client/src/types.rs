@@ -42,8 +42,9 @@ pub struct Twin {
     pub id: u32,
     // TODO: proper typing
     pub account_id: AccountId32,
-    pub ip: String,
+    pub relay: Option<String>,
     pub entities: Vec<EntityProof>,
+    pub pk: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]

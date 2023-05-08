@@ -70,23 +70,18 @@ impl From<RuntimeTwin<AccountId32>> for Twin {
             id,
             account_id,
             relay,
-            pk: _,
+            pk,
             entities,
         } = rt;
-
-        // For now, just parse relay as ip
-        let ip = match relay {
-            Some(r) => unsafe { String::from_utf8_unchecked(r.0) },
-            None => String::from(""),
-        };
 
         Twin {
             version: 0,
             id,
+            relay: relay
+                .map(|v| String::from_utf8(v.0).expect("chain only allows valid relay urls")),
             account_id,
-            // SAFETY: all on chain IP's are verified to be properly formatted as strings.
-            ip,
             entities: entities.into_iter().map(|e| e.into()).collect(),
+            pk: pk.map(|v| v.0),
         }
     }
 }
