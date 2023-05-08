@@ -14,15 +14,14 @@ use std::{
     path,
 };
 use tfchain_client::dynamic::DynamicClient;
-use tokio::sync::mpsc;
-// use tfchain_client::runtimes::v115::{client::Client, runtime};
 use tfchain_client::{
     client::{height_at_timestamp, RuntimeClient},
     types::{
-        Contract as ChainContract, ContractData, ContractResources, Farm, FarmPolicy, Location,
-        Node, NodeCertification, NodePower, Power, PowerState, Resources, RuntimeEvents,
+        Contract as ChainContract, ContractData, Farm, FarmPolicy, Location, Node,
+        NodeCertification, NodePower, Power, PowerState, Resources, RuntimeEvents,
     },
 };
+use tokio::sync::mpsc;
 
 mod period;
 mod receipt;
@@ -48,8 +47,6 @@ const CU_CARBON_OFFSET_MUSD: u64 = 354;
 /// (https://docs.google.com/spreadsheets/d/16uUJEArEb-3aDkHNTlsMpMovyqgLp9xtwzdgjdu-lGw/edit#gid=1395768004)
 /// on 01-02-2022.
 const SU_CARBON_OFFSET_MUSD: u64 = 122;
-/// Required uptime percentage in a period for nodes to be eligible for rewards.
-const UPTIME_SLA_PERCENT: u64 = 95;
 /// The address to which the carbon credit tft will be sent.
 /// Value provided by Andreas Hartl in a Telegram DM on 03-02-2022
 const CARBON_CREDIT_ADDRESS: &str = "GDIJY6K2BBRIRX423ZFUYKKFDN66XP2KMSBZFQSE2PSNDZ6EDVQTRLSU";
@@ -173,7 +170,7 @@ async fn main() {
                     location: node.location,
                     country: node.country,
                     city: node.city,
-                    created: node.created,
+                    _created: node.created,
                     certification_type: node.certification,
                     uptime_info: None,
                     first_uptime_violation: None,
@@ -245,7 +242,7 @@ async fn main() {
                 Some((
                     contract.contract_id,
                     Contract {
-                        contract_id: contract.contract_id,
+                        _contract_id: contract.contract_id,
                         node_id: nc.node_id,
                         // a report should pop up for this
                         last_report_ts: 0,
@@ -278,7 +275,6 @@ async fn main() {
         ProgressStyle::default_bar()
             .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
     );
-    let mut last_height = start_block - 1;
     let mut height = start_block;
     let mut import_queue = block_import(&wss_url, height as usize, end_block as usize).await;
     loop {
@@ -300,7 +296,7 @@ async fn main() {
                             location: node.location,
                             country: node.country,
                             city: node.city,
-                            created: node.created,
+                            _created: node.created,
                             certification_type: node.certification.clone(),
                             uptime_info: None,
                             first_uptime_violation: None,
@@ -529,7 +525,7 @@ async fn main() {
                         contracts.insert(
                             contract.contract_id,
                             Contract {
-                                contract_id: contract.contract_id,
+                                _contract_id: contract.contract_id,
                                 node_id: nc.node_id,
                                 last_report_ts: ts as i64,
                                 ips: nc.public_ips,
@@ -1033,7 +1029,7 @@ struct MintingNode {
     location: Location,
     country: String,
     city: String,
-    created: u64,
+    _created: u64,
     certification_type: NodeCertification,
     // (last ping, last reported uptime, total uptime).
     uptime_info: Option<(i64, u64, u64)>,
@@ -1249,14 +1245,6 @@ impl MintingNode {
         }
     }
 
-    /// Indicates if a node managed to achieve it's SLA in a period.
-    ///
-    /// Currently SLA is the same for all nodes, this might change in the future.
-    fn sla_achieved(&self, period: Period) -> bool {
-        let scaled_period = self.real_period(period);
-        self.uptime(scaled_period) * 100 / scaled_period.duration() >= UPTIME_SLA_PERCENT
-    }
-
     /// Get the adjusted uptime of the node
     fn uptime(&self, period: Period) -> u64 {
         let period_duration = self.real_period(period).duration();
@@ -1335,7 +1323,7 @@ impl MintingNode {
 }
 
 struct Contract {
-    contract_id: u64,
+    _contract_id: u64,
     node_id: u32,
     // timestamp of last report. If not set, time when the contract was created.
     last_report_ts: i64,

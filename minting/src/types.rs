@@ -87,28 +87,12 @@ pub struct PricingPolicy {
     pub discount_for_dedication_nodes: u8,
 }
 
-/// A list of Grandpa authorities with associated weights.
-pub type AuthorityList = Vec<(AuthorityId, AuthorityWeight)>;
-
-/// The grandpa authority ID type.
-pub type AuthorityId = ed25519::Public;
-
-/// The weight of an authority.
-pub type AuthorityWeight = u64;
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Balance(u64);
 
 impl From<u64> for Balance {
     fn from(amount: u64) -> Self {
         Balance(amount)
-    }
-}
-
-impl Balance {
-    /// Get the balance as the amount of units expressed as a u64.
-    pub fn as_u64(self) -> u64 {
-        self.0
     }
 }
 
