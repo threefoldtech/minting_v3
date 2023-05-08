@@ -18,7 +18,7 @@ use tfchain_client::{
     client::{height_at_timestamp, RuntimeClient},
     types::{
         Contract as ChainContract, ContractData, Farm, FarmPolicy, Location, Node,
-        NodeCertification, NodePower, Power, PowerState, Resources, RuntimeEvents,
+        NodeCertification, NodePower, Power, PowerState, Resources, RuntimeEvents, Twin,
     },
 };
 use tokio::sync::mpsc;
@@ -264,6 +264,14 @@ async fn main() {
         .map(|farm| (farm.id, farm))
         .collect();
     println!("Found {} existing farms", farms.len());
+
+    let twins: BTreeMap<_, _> = get_twins(&client, end_block)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|twin| (twin.id, twin))
+        .collect();
+    println!("Found {} existing twins", twins.len());
 
     let payout_addresses: BTreeMap<_, _> = get_payout_addresses(&client, &farms, end_block)
         .await
@@ -894,6 +902,31 @@ async fn main() {
     }
     bar.finish_and_clear();
 
+    // Check twin relays and public keys
+    for (_, node) in nodes.iter_mut() {
+        // We only care for nodes which are online.
+        if node.uptime_info.is_none() {
+            continue;
+        }
+        let twin = twins
+            .get(&node.twin_id)
+            .expect("node must have a valid twin");
+        let has_relay = match twin.relay {
+            None => false,
+            Some(ref s) if s.is_empty() => false,
+            _ => true,
+        };
+        if !has_relay && node.violation.is_none() {
+            node.violation = Violation::MissingRelay;
+        }
+        if let Some(ref pk) = twin.pk {
+            // Secp256k1 public key size is 33 bytes in compressed form
+            if pk.len() != 33 && node.violation.is_none() {
+                node.violation = Violation::InvalidPublicKey;
+            }
+        }
+    }
+
     let mut receipts = BTreeMap::new();
     let mut payout_file = std::fs::File::create("payouts.csv").unwrap();
     let mut overview_file = std::fs::File::create("overview.csv").unwrap();
@@ -1473,6 +1506,21 @@ pub async fn get_nodes(
         }
     }
     Ok(nodes)
+}
+
+pub async fn get_twins(
+    client: &dyn RuntimeClient,
+    block: u32,
+) -> Result<Vec<Twin>, Box<dyn std::error::Error>> {
+    let hash = client.hash_at_height(Some(block)).await?;
+    let twin_count = client.twin_count(hash).await?;
+    let mut twins = Vec::new();
+    for i in 1..=twin_count {
+        if let Some(twin) = client.twin(i, hash).await? {
+            twins.push(twin);
+        }
+    }
+    Ok(twins)
 }
 
 pub async fn get_farms(

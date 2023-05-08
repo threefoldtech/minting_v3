@@ -33,6 +33,12 @@ pub enum Violation {
         reported_timestamp: i64,
         block_reported: u32,
     },
+    /// Node has uptime, but node twin does not have a relay set. As a result, the node is not
+    /// useable.
+    MissingRelay,
+    /// A node twin has uptime, and has a public key set which is not valid. For reference, the
+    /// public key is a secp256k1 key in compressed format, which is 33 bytes in size.
+    InvalidPublicKey,
 }
 
 impl fmt::Display for Violation {
@@ -42,6 +48,8 @@ impl fmt::Display for Violation {
             Violation::UptimeTooHigh { previous_uptime, reported_uptime, previous_timestamp, reported_timestamp, block_reported } => f.write_fmt(format_args!("Node uptime increased more than time increased! Previous datapoint ({previous_timestamp}, {previous_uptime}), new datapoint ({reported_timestamp}, {reported_uptime}) in block {block_reported}")),
             Violation::UptimeTooLow { previous_uptime, reported_uptime, previous_timestamp, reported_timestamp, block_reported } => f.write_fmt(format_args!("Node uptime increased less than time increased, and node was not rebooted! Previous datapoint ({previous_timestamp}, {previous_uptime}), new datapoint ({reported_timestamp}, {reported_uptime}) in block {block_reported}")),
             Violation::InvalidReboot { previous_uptime, reported_uptime, previous_timestamp, reported_timestamp, block_reported } => f.write_fmt(format_args!("Node rebooted before the previous uptime report! Previous datapoint ({previous_timestamp}, {previous_uptime}), new datapoint ({reported_timestamp}, {reported_uptime}) in block {block_reported}")),
+            Violation::MissingRelay => f.pad("Node has uptime but the node twin does not have a relay set. As a result, the node is not useable and receives not tokens"),
+            Violation::InvalidPublicKey => f.pad("Node twin has a public key set, but it's not in a valid format"),
         }
     }
 }
