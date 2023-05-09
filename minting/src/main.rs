@@ -908,9 +908,15 @@ async fn main() {
         if node.uptime_info.is_none() {
             continue;
         }
-        let twin = twins
-            .get(&node.twin_id)
-            .expect("node must have a valid twin");
+        let twin = if let Some(twin) = twins.get(&node.twin_id) {
+            twin
+        } else {
+            // This should not happen, but still catch it
+            if node.violation.is_none() {
+                node.violation = Violation::MissingTwin;
+            }
+            continue;
+        };
         let has_relay = match twin.relay {
             None => false,
             Some(ref s) if s.is_empty() => false,
