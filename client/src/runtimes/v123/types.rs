@@ -63,7 +63,7 @@ impl From<RuntimeTwin<RuntimeTwinIP, AccountId32>> for Twin {
             version,
             id,
             account_id,
-            ip,
+            ip: _,
             entities,
         } = rt;
         Twin {

@@ -232,11 +232,11 @@ impl RuntimeClient for DynamicClient {
 
         let r: Vec<u8> = result.unwrap().into_encoded().into();
 
-        if let Ok(twin) = codec::decode_from_bytes::<V115Twin>(r.clone().into()) {
+        if let Ok(twin) = codec::decode_from_bytes::<V131Twin>(r.clone().into()) {
             Ok(Some(twin.into()))
         } else if let Ok(twin) = codec::decode_from_bytes::<V123Twin>(r.clone().into()) {
             Ok(Some(twin.into()))
-        } else if let Ok(twin) = codec::decode_from_bytes::<V131Twin>(r.clone().into()) {
+        } else if let Ok(twin) = codec::decode_from_bytes::<V115Twin>(r.clone().into()) {
             Ok(Some(twin.into()))
         } else {
             return Err(Error::ErrorDecodingTwin.into());
