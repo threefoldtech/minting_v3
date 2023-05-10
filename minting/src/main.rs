@@ -942,27 +942,48 @@ async fn main() {
 
     writeln!(overview_file,"node id,twin id,farm name (farm id),period start,period end,measured uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,carbon offset USD generated,carbon offset TFT generated,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,Virtualized,violation,stellar address").unwrap();
     for (_, node) in nodes {
-        let node_period = node.real_period(period);
-        let node_period_duration = node_period.duration();
+        // generate receipt
+        let receipt = node.receipt(period, &farms, &payout_addresses, &farming_policies);
+        if !receipt.stellar_payout_address.is_empty() && receipt.reward.tft != 0 {
+            writeln!(
+                payout_file,
+                "{},{}.{:07},{}",
+                receipt.stellar_payout_address,
+                receipt.reward.tft / UNITS_PER_TFT,
+                receipt.reward.tft % UNITS_PER_TFT,
+                hex::encode(receipt.hash()),
+            )
+            .unwrap();
+        }
+
+        //let node_period = node.real_period(period);
+        let node_period = receipt.period;
         let node_start = Utc.timestamp(node_period.start(), 0);
         let node_end = Utc.timestamp(node_period.end(), 0);
-        let (cu, su, nu) = node.cloud_units_permill();
-        let (musd, tft) = node.scaled_payout(period, &farming_policies);
-        let (co_musd, co_tft) = node.scaled_carbon_payout(period);
-        let cru_used = (node.capacity_consumption.cru / node_period_duration as u128) as u64;
-        let mru_used = (node.capacity_consumption.mru / node_period_duration as u128) as u64;
-        let hru_used = (node.capacity_consumption.hru / node_period_duration as u128) as u64;
-        let sru_used = (node.capacity_consumption.sru / node_period_duration as u128) as u64;
-        let farm = if let Some(farm) = farms.get(&node.farm_id) {
+        let CloudUnits { cu, su, nu } = receipt.cloud_units;
+        let Reward { musd, tft } = receipt.reward;
+        let Reward {
+            musd: co_musd,
+            tft: co_tft,
+        } = receipt.carbon_offset;
+        let ResourceUtilization {
+            cru: cru_used,
+            mru: mru_used,
+            hru: hru_used,
+            sru: sru_used,
+            ip: ip_used,
+        } = receipt.resource_utilization;
+        let farm = if let Some(farm) = farms.get(&receipt.farm_id) {
             farm
         } else {
             println!(
                 "node {} is in farm {} which does not exist anymore",
-                node.id, node.farm_id
+                receipt.node_id, receipt.farm_id
             );
             continue;
         };
-        let stellar_address = if let Some(stellar_address) = payout_addresses.get(&node.farm_id) {
+        let stellar_address = if let Some(stellar_address) = payout_addresses.get(&receipt.farm_id)
+        {
             &stellar_address
         } else {
             ""
@@ -975,50 +996,34 @@ async fn main() {
             node.farm_id,
             node_start,
             node_end,
-            node.uptime(period),
-            format_args!("{}.{:06}", cu / ONE_MILL as u64, cu % ONE_MILL as u64),
-            format_args!("{}.{:06}", su / ONE_MILL as u64, su % ONE_MILL as u64),
-            format_args!("{}.{:06}", nu / ONE_MILL as u64, nu % ONE_MILL as u64),
+            receipt.measured_uptime,
+            format_args!("{:.6}", cu ),
+            format_args!("{:.6}", su ),
+            format_args!("{:.6}", nu ),
             format_args!("{}.{:03}", musd / 1_000, musd % 1_000),
             format_args!("{}.{:07}", tft / UNITS_PER_TFT, tft % UNITS_PER_TFT),
             format_args!(
                 "{}.{:03}",
-                node.connection_price / 1_000,
-                node.connection_price % 1_000
+                receipt.tft_connection_price / 1_000,
+                receipt.tft_connection_price % 1_000
             ),
             format_args!("{}.{:03}", co_musd / 1_000, co_musd % 1_000),
             format_args!("{}.{:07}", co_tft / UNITS_PER_TFT, co_tft % UNITS_PER_TFT),
-            node.resources.cru,
-            if node.resources.cru > 0 {cru_used as f64 * 100. / node.resources.cru as f64} else { 0.},
-            node.resources.mru,
-            if node.resources.mru > 0 {mru_used as f64 * 100. / node.resources.mru as f64} else {0.},
-            node.resources.hru,
-            if node.resources.hru > 0 {hru_used as f64 * 100. / node.resources.hru as f64} else {0.},
-            node.resources.sru,
-            if node.resources.sru > 0 {sru_used as f64 * 100. / node.resources.sru as f64} else {0.},
-            node.capacity_consumption.ips as f64 / 3600.,
-            if let NodeCertification::Certified = node.certification_type {
-                "CERTIFIED"
-            } else {
-                "DIY"
-            },
+            receipt.resource_units.cru,
+            cru_used,
+            receipt.resource_units.mru,
+            mru_used,
+            receipt.resource_units.hru,
+            hru_used,
+            receipt.resource_units.sru,
+            sru_used,
+            ip_used,
+            receipt.node_type,
             node.virtualized,
             node.violation,
             stellar_address,
         ).unwrap();
 
-        let receipt = node.receipt(period, &farms, &payout_addresses, &farming_policies);
-        if !stellar_address.is_empty() && tft != 0 {
-            writeln!(
-                payout_file,
-                "{},{}.{:07},{}",
-                stellar_address,
-                tft / UNITS_PER_TFT,
-                tft % UNITS_PER_TFT,
-                hex::encode(receipt.hash()),
-            )
-            .unwrap();
-        }
         receipts.insert(receipt.hash(), receipt);
 
         // Count carbon TFT credits
