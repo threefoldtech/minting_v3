@@ -758,7 +758,7 @@ async fn main() {
                         };
                         // Only add uptime if node came back online in time.
                         if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
-                            let uptime_diff = end_ts - i64::min(start_ts, time_set_down);
+                            let uptime_diff = end_ts - i64::max(start_ts, time_set_down);
                             assert!(
                                 uptime_diff >= 0,
                                 "uptime event must be sent after node wen't down, chronology"
