@@ -484,7 +484,7 @@ async fn main() {
                                     // That being said, we also limit the amount of uptime credit
                                     // to the uptime report interval + grace period, as healthy
                                     // nodes _must_ ping every interval amount of time
-                                    total_uptime += u64::max(
+                                    total_uptime += u64::min(
                                         uptime_delta as u64,
                                         (NODE_UPTIME_REPORT_INTERVAL_SECONDS
                                             + UPTIME_GRACE_PERIOD_SECONDS)
@@ -502,7 +502,7 @@ async fn main() {
                             //
                             //    1. Uptime is within bounds.
                             if reported_uptime as i64 <= report_delta {
-                                total_uptime += u64::max(
+                                total_uptime += u64::min(
                                     reported_uptime,
                                     (NODE_UPTIME_REPORT_INTERVAL_SECONDS
                                         + UPTIME_GRACE_PERIOD_SECONDS)
@@ -545,7 +545,7 @@ async fn main() {
                             // Make sure we don't give more credit than the current length of the
                             // period.
                             // Account for uptime period
-                            let up_in_period = u64::max(
+                            let up_in_period = u64::min(
                                 std::cmp::min(period_duration as u64, reported_uptime),
                                 (NODE_UPTIME_REPORT_INTERVAL_SECONDS + UPTIME_GRACE_PERIOD_SECONDS)
                                     as u64,
@@ -758,7 +758,7 @@ async fn main() {
                         };
                         // Only add uptime if node came back online in time.
                         if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
-                            let uptime_diff = end_ts - i64::max(start_ts, time_set_down);
+                            let uptime_diff = end_ts - i64::min(start_ts, time_set_down);
                             assert!(
                                 uptime_diff >= 0,
                                 "uptime event must be sent after node wen't down, chronology"
@@ -819,7 +819,7 @@ async fn main() {
                                     // couple of seconds it will be corrected by the next pings anyhow.
                                     //
                                     // Make sure we don't add too much based on the period.
-                                    total_uptime += u64::max(
+                                    total_uptime += u64::min(
                                         delta_in_period as u64,
                                         (NODE_UPTIME_REPORT_INTERVAL_SECONDS
                                             + UPTIME_GRACE_PERIOD_SECONDS)
@@ -840,7 +840,7 @@ async fn main() {
                                 // Account for the fact that we are actually out of the period
                                 let out_of_period = current_time - end_ts as u64;
                                 if out_of_period < reported_uptime {
-                                    total_uptime += u64::max(
+                                    total_uptime += u64::min(
                                         reported_uptime - out_of_period,
                                         (NODE_UPTIME_REPORT_INTERVAL_SECONDS
                                             + UPTIME_GRACE_PERIOD_SECONDS)
