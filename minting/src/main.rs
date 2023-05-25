@@ -454,6 +454,9 @@ async fn main() {
                             node.power_managed = None;
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, total_uptime));
+                            // Also mark a boot
+                            node.boot_time =
+                                Some(((current_time - reported_uptime) as i64, current_time as i64));
                         }
                     } else {
                         if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
@@ -809,6 +812,9 @@ async fn main() {
                         node.power_managed = None;
                         node.uptime_info =
                             Some((current_time as i64, reported_uptime, total_uptime));
+                        // Also mark a boot
+                        node.boot_time =
+                            Some(((current_time - reported_uptime) as i64, current_time as i64));
                     } else {
                         if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
                             node.uptime_info
