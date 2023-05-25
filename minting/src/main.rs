@@ -67,6 +67,17 @@ const PRE_FETCH: usize = 5;
 ///
 /// Numbers are accurate as of 2023-05-08.
 const UPTIME_GRACE_PERIOD_SECONDS: i64 = 60; // 1 Minute
+/// The maximum allowed clock drift while measuring. Ideally this should be less and this should
+/// probably be constrained in the future. We take twice the amount of UPTIME_GRACE_PERIOD_SECONDS
+/// for now because we consider that a node can have a skew in one direction of up to this amount,
+/// and it would technically be possible to have the same skew in the opposing direction without
+/// being considered a validation.
+///
+/// In practice, a skew which is allowed by the above will happen in one direction and then be
+/// fixed later, so technically speaking a copy of the above should be sufficient. To be validated.
+// FIXME: This check is faulty as it is way to broad in it's current form, and malfunctioning nodes
+// might not be detected.
+const CLOCK_SKEW_INTERVAL: i64 = 2 * UPTIME_GRACE_PERIOD_SECONDS;
 const NODE_UPTIME_REPORT_INTERVAL_SECONDS: i64 = 60 * 40; // 40 minutes
 const GIB: u128 = 1024 * 1024 * 1024;
 const ONE_MILL: u128 = 1_000_000;
@@ -210,6 +221,7 @@ async fn main() {
                     _created: node.created,
                     certification_type: node.certification,
                     uptime_info: None,
+                    boot_time: None,
                     violation: Violation::None,
                     connected: NodeConnected::Old,
                     connection_price: node.connection_price,
@@ -344,6 +356,7 @@ async fn main() {
                             _created: node.created,
                             certification_type: node.certification.clone(),
                             uptime_info: None,
+                            boot_time: None,
                             violation: Violation::None,
                             connected: NodeConnected::Current(ts as i64),
                             connection_price: node.connection_price,
@@ -474,6 +487,24 @@ async fn main() {
                             if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
                                 && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
                             {
+                                // check skew
+                                if let Some((boot, detected)) = node.boot_time {
+                                    let new_boot = (current_time - reported_uptime) as i64;
+                                    if (new_boot - boot).abs() >= CLOCK_SKEW_INTERVAL {
+                                        // This is a violation
+                                        if node.violation.is_none() {
+                                            node.violation = Violation::ClockSkew {
+                                                original_boot: boot,
+                                                current_boot: new_boot,
+                                                previous_timestamp: detected,
+                                                reported_timestamp: current_time as i64,
+                                            };
+                                        }
+                                    }
+                                } else {
+                                    panic!("node does not have boot time but does have uptime")
+                                }
+
                                 // It is technically possible for the delta to be less than 0 and
                                 // within the expected time frame. If nodes boot, send uptime, then
                                 // immediately reboot that is possible. In those cases, handle that
@@ -510,6 +541,10 @@ async fn main() {
                                 );
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
+                                node.boot_time = Some((
+                                    (current_time - reported_uptime) as i64,
+                                    current_time as i64,
+                                ));
                                 continue;
                             }
                             //    2. Uptime is actually higher than difference in timestamp, but
@@ -553,6 +588,10 @@ async fn main() {
                             // Save uptime info
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, up_in_period));
+                            node.boot_time = Some((
+                                (current_time - reported_uptime) as i64,
+                                current_time as i64,
+                            ));
                         }
                     }
                 }
@@ -810,6 +849,24 @@ async fn main() {
                             if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
                                 && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
                             {
+                                // check skew
+                                if let Some((boot, detected)) = node.boot_time {
+                                    let new_boot = (current_time - reported_uptime) as i64;
+                                    if (new_boot - boot).abs() >= CLOCK_SKEW_INTERVAL {
+                                        // This is a violation
+                                        if node.violation.is_none() {
+                                            node.violation = Violation::ClockSkew {
+                                                original_boot: boot,
+                                                current_boot: new_boot,
+                                                previous_timestamp: detected,
+                                                reported_timestamp: current_time as i64,
+                                            };
+                                        }
+                                    }
+                                } else {
+                                    panic!("node does not have boot time but does have uptime")
+                                }
+
                                 // It is technically possible for the delta to be less than 0 and
                                 // within the expected time frame. If nodes boot, send uptime, then
                                 // immediately reboot that is possible. In those cases, handle that
@@ -849,6 +906,10 @@ async fn main() {
                                 }
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
+                                node.boot_time = Some((
+                                    (current_time - reported_uptime) as i64,
+                                    current_time as i64,
+                                ));
                                 continue;
                             }
                             //    2. Uptime is actually higher than difference in timestamp, but
@@ -1195,6 +1256,8 @@ struct MintingNode {
     certification_type: NodeCertification,
     // (last ping, last reported uptime, total uptime).
     uptime_info: Option<(i64, u64, u64)>,
+    // (boot time, original boot time record).
+    boot_time: Option<(i64, i64)>,
     violation: Violation,
     connected: NodeConnected,
     // TFT price expressed in USD at time of connection. Price is expressed in mUSD (3 digits

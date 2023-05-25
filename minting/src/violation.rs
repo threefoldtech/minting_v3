@@ -33,6 +33,13 @@ pub enum Violation {
         reported_timestamp: i64,
         block_reported: u32,
     },
+    /// There is a significant amount of clock skew over a longer period of time.
+    ClockSkew {
+        original_boot: i64,
+        current_boot: i64,
+        previous_timestamp: i64,
+        reported_timestamp: i64,
+    },
     /// Node has uptime, but node twin does not have a relay set. As a result, the node is not
     /// useable.
     MissingRelay,
@@ -50,6 +57,7 @@ impl fmt::Display for Violation {
             Violation::UptimeTooHigh { previous_uptime, reported_uptime, previous_timestamp, reported_timestamp, block_reported } => f.write_fmt(format_args!("Node uptime increased more than time increased | Previous datapoint ({previous_timestamp} - {previous_uptime}) new datapoint ({reported_timestamp} - {reported_uptime}) in block {block_reported}")),
             Violation::UptimeTooLow { previous_uptime, reported_uptime, previous_timestamp, reported_timestamp, block_reported } => f.write_fmt(format_args!("Node uptime increased less than time increased and node was not rebooted | Previous datapoint ({previous_timestamp} - {previous_uptime}) new datapoint ({reported_timestamp} - {reported_uptime}) in block {block_reported}")),
             Violation::InvalidReboot { previous_uptime, reported_uptime, previous_timestamp, reported_timestamp, block_reported } => f.write_fmt(format_args!("Node rebooted before the previous uptime report | Previous datapoint ({previous_timestamp} - {previous_uptime}) new datapoint ({reported_timestamp} - {reported_uptime}) in block {block_reported}")),
+            Violation::ClockSkew { original_boot, current_boot, previous_timestamp, reported_timestamp } => f.write_fmt(format_args!("Node has significant clock skew over a period of time | original boot time {original_boot} detected at {previous_timestamp} - {current_boot} detected at {reported_timestamp}")),
             Violation::MissingRelay => f.pad("Node has uptime but the node twin does not have a relay set"),
             Violation::InvalidPublicKey => f.pad("Node twin has a public key set but it's not in a valid format"),
             Violation::MissingTwin => f.pad("Node twin does not exist"),
