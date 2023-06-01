@@ -71,16 +71,18 @@ impl From<RuntimeTwin<RuntimeTwinIP, AccountId32>> for Twin {
             version,
             id,
             account_id,
-            ip: _,
+            ip,
             entities,
         } = rt;
         Twin {
             version,
             id,
             account_id,
-            relay: None,
+            // SAFETY: all on chain IP's are verified to be properly formatted as strings.
+            ip: unsafe { String::from_utf8_unchecked(ip.0 .0) }
+                .parse()
+                .unwrap(),
             entities: entities.into_iter().map(|e| e.into()).collect(),
-            pk: None,
         }
     }
 }

@@ -1,4 +1,4 @@
-use crate::{period::Period, violation::Violation};
+use crate::period::Period;
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use chrono::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -14,71 +14,24 @@ use std::{
     path,
 };
 use tfchain_client::dynamic::DynamicClient;
+use tokio::sync::mpsc;
+// use tfchain_client::runtimes::v115::{client::Client, runtime};
 use tfchain_client::{
     client::{height_at_timestamp, RuntimeClient},
     types::{
-        Contract as ChainContract, ContractData, Farm, FarmPolicy, Location, Node,
-        NodeCertification, NodePower, Power, PowerState, Resources, RuntimeEvents, Twin,
+        Contract as ChainContract, ContractData, ContractResources, Farm, FarmPolicy, Location,
+        Node, NodeCertification, NodePower, Power, PowerState, Resources, RuntimeEvents,
     },
 };
-use tokio::sync::mpsc;
 
 mod period;
 mod receipt;
 mod stellar;
 mod types;
-mod violation;
 
 const RPC_THREADS: usize = 24;
 const PRE_FETCH: usize = 5;
-/// Currently on TFchain, the weight limit of a block is `2_000_000_000_000`. The vast majority of
-/// calls are `UptimeReported` calls and `billContractForBlock` calls. The former has an associated
-/// weight of `446_058_000`, while the latter has an associated weight of `780_660_000`. Given that
-/// a node sends an uptime report every 40 minutes, the expected amount of uptime reports is (nr
-/// nodes * 1.5) per hour, while the expected billContractForBlock call amount per hour is simply
-/// nr contracts. Additionally, as part of billing we also have `addNruReports`, which is called
-/// once per hour for every contract (technically nodes with contracts call this once per hour and
-/// it contains multiple contracts, but the weight scales roughly linearly with the amount of
-/// contracts). The weight of one call is `473_727_000`. For calculating the density of these
-/// calls, we assume all nodes are up. This gives about 5500 nodes. We also assume 750 contracts
-/// (values are taken at the time of writing).
-///
-/// Since uptime reporting depends on boot time, and contract billing depends on contract creation
-/// time, we can use the law of large numbers to model these events as evenly distributed across
-/// the available blocks. With a block time of 6 seconds, there are assumed to be 600 blocks per
-/// hour for a fully functioning chain. Additionally, if a block is missed, the calls for that
-/// block will be added to the next block, recursively, until a block is created. This means that,
-/// a block contains all calls for itself and all previously missed blocks.
-///
-/// For a fully functioning chain, the used weight is 5500/600*780_660_000 +
-/// 750/600*(446_058_000+473_727_000). This amounts to 7_156_050_000 + 1_149_731_250 =
-/// 8_305_892_250. Considering the previously established block allowed weight of 2E12, that equals
-/// to an average of 0.415% of a block. Even if we are pessimistic and assume the actual weight of
-/// calls should be double, AND the chain increases 10 times in size of both nodes and contracts,
-/// we are only at 8.30% weight, which should not be a problem at all. Considering there are 10
-/// block creators, this means we could loose all of them but one and still not have a problem for
-/// nodes to push uptimes (note the chain requires more than 2/3 i.e. at least 7 block creators
-/// before finalization stalled, so we can assume at most 3 nodes are down at once).
-///
-/// Considering these constraints, and the invariant that nodes send an uptime report every 40
-/// minutes, 1 minute is a sufficiently large grace period: this allows for nodes to _still_ get
-/// their uptime reports in the chain even if all nodes on the chain are down except one (which as
-/// discussed above is a critical chain situation).
-///
-/// Numbers are accurate as of 2023-05-08.
-const UPTIME_GRACE_PERIOD_SECONDS: i64 = 60; // 1 Minute
-/// The maximum allowed clock drift while measuring. Ideally this should be less and this should
-/// probably be constrained in the future. We take twice the amount of UPTIME_GRACE_PERIOD_SECONDS
-/// for now because we consider that a node can have a skew in one direction of up to this amount,
-/// and it would technically be possible to have the same skew in the opposing direction without
-/// being considered a validation.
-///
-/// In practice, a skew which is allowed by the above will happen in one direction and then be
-/// fixed later, so technically speaking a copy of the above should be sufficient. To be validated.
-// FIXME: This check is faulty as it is way to broad in it's current form, and malfunctioning nodes
-// might not be detected.
-const CLOCK_SKEW_INTERVAL: i64 = 2 * UPTIME_GRACE_PERIOD_SECONDS;
-const NODE_UPTIME_REPORT_INTERVAL_SECONDS: i64 = 60 * 40; // 40 minutes
+const UPTIME_GRACE_PERIOD_SECONDS: i64 = 300; // 5 Minutes
 const GIB: u128 = 1024 * 1024 * 1024;
 const ONE_MILL: u128 = 1_000_000;
 /// The amount of "units" that make 1 TFT.
@@ -95,6 +48,8 @@ const CU_CARBON_OFFSET_MUSD: u64 = 354;
 /// (https://docs.google.com/spreadsheets/d/16uUJEArEb-3aDkHNTlsMpMovyqgLp9xtwzdgjdu-lGw/edit#gid=1395768004)
 /// on 01-02-2022.
 const SU_CARBON_OFFSET_MUSD: u64 = 122;
+/// Required uptime percentage in a period for nodes to be eligible for rewards.
+const UPTIME_SLA_PERCENT: u64 = 95;
 /// The address to which the carbon credit tft will be sent.
 /// Value provided by Andreas Hartl in a Telegram DM on 03-02-2022
 const CARBON_CREDIT_ADDRESS: &str = "GDIJY6K2BBRIRX423ZFUYKKFDN66XP2KMSBZFQSE2PSNDZ6EDVQTRLSU";
@@ -103,7 +58,7 @@ const CARBON_CREDIT_ADDRESS: &str = "GDIJY6K2BBRIRX423ZFUYKKFDN66XP2KMSBZFQSE2PS
 const HORIZON_URL: &str = "https://horizon.stellar.org";
 /// Maximum amount of seconds a node can be offline because of the power managment feature while
 /// still getting rewards.
-const MAX_POWER_MANAGER_DOWNTIME: u64 = 60 * 60 * 24;
+const MAX_POWER_MANAGER_DOWNTIME: u64 = 60 * 60 * 25;
 
 #[tokio::main]
 async fn main() {
@@ -218,11 +173,10 @@ async fn main() {
                     location: node.location,
                     country: node.country,
                     city: node.city,
-                    _created: node.created,
+                    created: node.created,
                     certification_type: node.certification,
                     uptime_info: None,
-                    boot_time: None,
-                    violation: Violation::None,
+                    first_uptime_violation: None,
                     connected: NodeConnected::Old,
                     connection_price: node.connection_price,
                     capacity_consumption: TotalConsumption::default(),
@@ -277,14 +231,6 @@ async fn main() {
         .collect();
     println!("Found {} existing farms", farms.len());
 
-    let twins: BTreeMap<_, _> = get_twins(&client, end_block)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|twin| (twin.id, twin))
-        .collect();
-    println!("Found {} existing twins", twins.len());
-
     let payout_addresses: BTreeMap<_, _> = get_payout_addresses(&client, &farms, end_block)
         .await
         .unwrap();
@@ -299,7 +245,7 @@ async fn main() {
                 Some((
                     contract.contract_id,
                     Contract {
-                        _contract_id: contract.contract_id,
+                        contract_id: contract.contract_id,
                         node_id: nc.node_id,
                         // a report should pop up for this
                         last_report_ts: 0,
@@ -332,6 +278,7 @@ async fn main() {
         ProgressStyle::default_bar()
             .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
     );
+    let mut last_height = start_block - 1;
     let mut height = start_block;
     let mut import_queue = block_import(&wss_url, height as usize, end_block as usize).await;
     loop {
@@ -353,11 +300,10 @@ async fn main() {
                             location: node.location,
                             country: node.country,
                             city: node.city,
-                            _created: node.created,
+                            created: node.created,
                             certification_type: node.certification.clone(),
                             uptime_info: None,
-                            boot_time: None,
-                            violation: Violation::None,
+                            first_uptime_violation: None,
                             connected: NodeConnected::Current(ts as i64),
                             connection_price: node.connection_price,
                             capacity_consumption: TotalConsumption::default(),
@@ -454,9 +400,6 @@ async fn main() {
                             node.power_managed = None;
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, total_uptime));
-                            // Also mark a boot
-                            node.boot_time =
-                                Some(((current_time - reported_uptime) as i64, current_time as i64));
                         }
                     } else {
                         if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
@@ -472,15 +415,11 @@ async fn main() {
                             // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
                             //    rubish.
                             if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                                if node.violation.is_none() {
-                                    node.violation = Violation::UptimeTooHigh {
-                                        previous_uptime: last_reported_uptime,
-                                        previous_timestamp: last_reported_at,
-                                        reported_uptime,
-                                        reported_timestamp: ts,
-                                        block_reported: height,
-                                    };
-                                }
+                                // This is possible if a node lags when sending uptime (extrinsic
+                                // takes a while to be accepted). Manual data validation found no
+                                // issues (i.e. all incidents of this type were a result of the
+                                // above). This should be changed in the future.
+                                total_uptime += uptime_delta as u64;
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
@@ -490,24 +429,6 @@ async fn main() {
                             if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
                                 && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
                             {
-                                // check skew
-                                if let Some((boot, detected)) = node.boot_time {
-                                    let new_boot = (current_time - reported_uptime) as i64;
-                                    if (new_boot - boot).abs() >= CLOCK_SKEW_INTERVAL {
-                                        // This is a violation
-                                        if node.violation.is_none() {
-                                            node.violation = Violation::ClockSkew {
-                                                original_boot: boot,
-                                                current_boot: new_boot,
-                                                previous_timestamp: detected,
-                                                reported_timestamp: current_time as i64,
-                                            };
-                                        }
-                                    }
-                                } else {
-                                    panic!("node does not have boot time but does have uptime")
-                                }
-
                                 // It is technically possible for the delta to be less than 0 and
                                 // within the expected time frame. If nodes boot, send uptime, then
                                 // immediately reboot that is possible. In those cases, handle that
@@ -515,15 +436,7 @@ async fn main() {
                                 if uptime_delta > 0 {
                                     // Simply add the uptime delta. If this is too large or low by a
                                     // couple of seconds it will be corrected by the next pings anyhow.
-                                    // That being said, we also limit the amount of uptime credit
-                                    // to the uptime report interval + grace period, as healthy
-                                    // nodes _must_ ping every interval amount of time
-                                    total_uptime += u64::min(
-                                        uptime_delta as u64,
-                                        (NODE_UPTIME_REPORT_INTERVAL_SECONDS
-                                            + UPTIME_GRACE_PERIOD_SECONDS)
-                                            as u64,
-                                    );
+                                    total_uptime += uptime_delta as u64;
                                     node.uptime_info =
                                         Some((current_time as i64, reported_uptime, total_uptime));
                                     continue;
@@ -536,65 +449,33 @@ async fn main() {
                             //
                             //    1. Uptime is within bounds.
                             if reported_uptime as i64 <= report_delta {
-                                total_uptime += u64::min(
-                                    reported_uptime,
-                                    (NODE_UPTIME_REPORT_INTERVAL_SECONDS
-                                        + UPTIME_GRACE_PERIOD_SECONDS)
-                                        as u64,
-                                );
+                                total_uptime += reported_uptime;
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
-                                node.boot_time = Some((
-                                    (current_time - reported_uptime) as i64,
-                                    current_time as i64,
-                                ));
                                 continue;
                             }
-                            //    2. Uptime is actually higher than difference in timestamp, but
-                            //       not high enough to be valid. This means the node was
-                            //       supposedly rebooted _before_ the previous uptime report,
-                            //       meaning either that report is invalid or this report is
-                            //       invalid.
+                            //    2. Uptime is higher than previously recorded uptime but too low.
+                            //    This might be a result off network congestion.
                             if reported_uptime > last_reported_uptime {
-                                if node.violation.is_none() {
-                                    node.violation = Violation::UptimeTooLow {
-                                        previous_uptime: last_reported_uptime,
-                                        previous_timestamp: last_reported_at,
-                                        reported_uptime,
-                                        reported_timestamp: ts,
-                                        block_reported: height,
-                                    };
-                                }
+                                total_uptime += uptime_delta as u64;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
                             }
                             //    3. Uptime is too high, this is garbage
-                            if node.violation.is_none() {
-                                node.violation = Violation::InvalidReboot {
-                                    previous_uptime: last_reported_uptime,
-                                    previous_timestamp: last_reported_at,
-                                    reported_uptime,
-                                    reported_timestamp: ts,
-                                    block_reported: height,
-                                }
+                            if node.first_uptime_violation.is_none() {
+                                node.first_uptime_violation = Some((last_reported_at, height));
                             }
                             continue;
                         } else {
                             let period_duration = current_time as i64 - start_ts;
                             // Make sure we don't give more credit than the current length of the
                             // period.
-                            // Account for uptime period
-                            let up_in_period = u64::min(
-                                std::cmp::min(period_duration as u64, reported_uptime),
-                                (NODE_UPTIME_REPORT_INTERVAL_SECONDS + UPTIME_GRACE_PERIOD_SECONDS)
-                                    as u64,
-                            );
+                            let up_in_period =
+                                std::cmp::min(period_duration as u64, reported_uptime);
                             // Save uptime info
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, up_in_period));
-                            node.boot_time = Some((
-                                (current_time - reported_uptime) as i64,
-                                current_time as i64,
-                            ));
                         }
                     }
                 }
@@ -656,7 +537,7 @@ async fn main() {
                         contracts.insert(
                             contract.contract_id,
                             Contract {
-                                _contract_id: contract.contract_id,
+                                contract_id: contract.contract_id,
                                 node_id: nc.node_id,
                                 last_report_ts: ts as i64,
                                 ips: nc.public_ips,
@@ -812,9 +693,6 @@ async fn main() {
                         node.power_managed = None;
                         node.uptime_info =
                             Some((current_time as i64, reported_uptime, total_uptime));
-                        // Also mark a boot
-                        node.boot_time =
-                            Some(((current_time - reported_uptime) as i64, current_time as i64));
                     } else {
                         if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
                             node.uptime_info
@@ -834,18 +712,9 @@ async fn main() {
                             // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
                             //    rubish.
                             if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                                // We need to register the violation here as we won't be able to
-                                // next period (since we don't scrape points from before the period
-                                // atm).
-                                if node.violation.is_none() {
-                                    node.violation = Violation::UptimeTooHigh {
-                                        previous_uptime: last_reported_uptime,
-                                        previous_timestamp: last_reported_at,
-                                        reported_uptime,
-                                        reported_timestamp: ts,
-                                        block_reported: height,
-                                    };
-                                }
+                                // This will actually be picked up next period as a violation if we
+                                // care for that.
+                                total_uptime += delta_in_period as u64;
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
@@ -855,24 +724,6 @@ async fn main() {
                             if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
                                 && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
                             {
-                                // check skew
-                                if let Some((boot, detected)) = node.boot_time {
-                                    let new_boot = (current_time - reported_uptime) as i64;
-                                    if (new_boot - boot).abs() >= CLOCK_SKEW_INTERVAL {
-                                        // This is a violation
-                                        if node.violation.is_none() {
-                                            node.violation = Violation::ClockSkew {
-                                                original_boot: boot,
-                                                current_boot: new_boot,
-                                                previous_timestamp: detected,
-                                                reported_timestamp: current_time as i64,
-                                            };
-                                        }
-                                    }
-                                } else {
-                                    panic!("node does not have boot time but does have uptime")
-                                }
-
                                 // It is technically possible for the delta to be less than 0 and
                                 // within the expected time frame. If nodes boot, send uptime, then
                                 // immediately reboot that is possible. In those cases, handle that
@@ -882,12 +733,7 @@ async fn main() {
                                     // couple of seconds it will be corrected by the next pings anyhow.
                                     //
                                     // Make sure we don't add too much based on the period.
-                                    total_uptime += u64::min(
-                                        delta_in_period as u64,
-                                        (NODE_UPTIME_REPORT_INTERVAL_SECONDS
-                                            + UPTIME_GRACE_PERIOD_SECONDS)
-                                            as u64,
-                                    );
+                                    total_uptime += delta_in_period as u64;
                                     node.uptime_info =
                                         Some((current_time as i64, reported_uptime, total_uptime));
                                     continue;
@@ -903,47 +749,23 @@ async fn main() {
                                 // Account for the fact that we are actually out of the period
                                 let out_of_period = current_time - end_ts as u64;
                                 if out_of_period < reported_uptime {
-                                    total_uptime += u64::min(
-                                        reported_uptime - out_of_period,
-                                        (NODE_UPTIME_REPORT_INTERVAL_SECONDS
-                                            + UPTIME_GRACE_PERIOD_SECONDS)
-                                            as u64,
-                                    );
+                                    total_uptime += reported_uptime - out_of_period;
                                 }
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
-                                node.boot_time = Some((
-                                    (current_time - reported_uptime) as i64,
-                                    current_time as i64,
-                                ));
                                 continue;
                             }
-                            //    2. Uptime is actually higher than difference in timestamp, but
-                            //       not high enough to be valid. This means the node was
-                            //       supposedly rebooted _before_ the previous uptime report,
-                            //       meaning either that report is invalid or this report is
-                            //       invalid.
+                            //    2. Uptime is higher than previously recorded uptime but too low.
+                            //    This might be a result off network congestion.
                             if reported_uptime > last_reported_uptime {
-                                if node.violation.is_none() {
-                                    node.violation = Violation::UptimeTooLow {
-                                        previous_uptime: last_reported_uptime,
-                                        previous_timestamp: last_reported_at,
-                                        reported_uptime,
-                                        reported_timestamp: ts,
-                                        block_reported: height,
-                                    };
-                                }
+                                total_uptime += uptime_delta as u64;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
                                 continue;
                             }
                             //    3. Uptime is too high, this is garbage
-                            if node.violation.is_none() {
-                                node.violation = Violation::InvalidReboot {
-                                    previous_uptime: last_reported_uptime,
-                                    previous_timestamp: last_reported_at,
-                                    reported_uptime,
-                                    reported_timestamp: ts,
-                                    block_reported: height,
-                                };
+                            if node.first_uptime_violation.is_none() {
+                                node.first_uptime_violation = Some((last_reported_at, height));
                                 continue;
                             }
 
@@ -958,6 +780,7 @@ async fn main() {
             }
         }
 
+        //bar.set_message(format!("{}/7200", height - end_block,));
         bar.set_message(Utc.timestamp(ts as i64, 0).to_rfc2822());
         bar.inc(1);
 
@@ -969,37 +792,6 @@ async fn main() {
     }
     bar.finish_and_clear();
 
-    // Check twin relays and public keys
-    for (_, node) in nodes.iter_mut() {
-        // We only care for nodes which are online.
-        if node.uptime_info.is_none() {
-            continue;
-        }
-        let twin = if let Some(twin) = twins.get(&node.twin_id) {
-            twin
-        } else {
-            // This should not happen, but still catch it
-            if node.violation.is_none() {
-                node.violation = Violation::MissingTwin;
-            }
-            continue;
-        };
-        let has_relay = match twin.relay {
-            None => false,
-            Some(ref s) if s.is_empty() => false,
-            _ => true,
-        };
-        if !has_relay && node.violation.is_none() {
-            node.violation = Violation::MissingRelay;
-        }
-        if let Some(ref pk) = twin.pk {
-            // Secp256k1 public key size is 33 bytes in compressed form
-            if pk.len() != 33 && node.violation.is_none() {
-                node.violation = Violation::InvalidPublicKey;
-            }
-        }
-    }
-
     let mut receipts = BTreeMap::new();
     let mut payout_file = std::fs::File::create("payouts.csv").unwrap();
     let mut overview_file = std::fs::File::create("overview.csv").unwrap();
@@ -1009,48 +801,27 @@ async fn main() {
 
     writeln!(overview_file,"node id,twin id,farm name (farm id),period start,period end,measured uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,carbon offset USD generated,carbon offset TFT generated,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,Virtualized,violation,stellar address").unwrap();
     for (_, node) in nodes {
-        // generate receipt
-        let receipt = node.receipt(period, &farms, &payout_addresses, &farming_policies);
-        if !receipt.stellar_payout_address.is_empty() && receipt.reward.tft != 0 {
-            writeln!(
-                payout_file,
-                "{},{}.{:07},{}",
-                receipt.stellar_payout_address,
-                receipt.reward.tft / UNITS_PER_TFT,
-                receipt.reward.tft % UNITS_PER_TFT,
-                hex::encode(receipt.hash()),
-            )
-            .unwrap();
-        }
-
-        //let node_period = node.real_period(period);
-        let node_period = receipt.period;
+        let node_period = node.real_period(period);
+        let node_period_duration = node_period.duration();
         let node_start = Utc.timestamp(node_period.start(), 0);
         let node_end = Utc.timestamp(node_period.end(), 0);
-        let CloudUnits { cu, su, nu } = receipt.cloud_units;
-        let Reward { musd, tft } = receipt.reward;
-        let Reward {
-            musd: co_musd,
-            tft: co_tft,
-        } = receipt.carbon_offset;
-        let ResourceUtilization {
-            cru: cru_used,
-            mru: mru_used,
-            hru: hru_used,
-            sru: sru_used,
-            ip: ip_used,
-        } = receipt.resource_utilization;
-        let farm = if let Some(farm) = farms.get(&receipt.farm_id) {
+        let (cu, su, nu) = node.cloud_units_permill();
+        let (musd, tft) = node.scaled_payout(period, &farming_policies);
+        let (co_musd, co_tft) = node.scaled_carbon_payout(period);
+        let cru_used = (node.capacity_consumption.cru / node_period_duration as u128) as u64;
+        let mru_used = (node.capacity_consumption.mru / node_period_duration as u128) as u64;
+        let hru_used = (node.capacity_consumption.hru / node_period_duration as u128) as u64;
+        let sru_used = (node.capacity_consumption.sru / node_period_duration as u128) as u64;
+        let farm = if let Some(farm) = farms.get(&node.farm_id) {
             farm
         } else {
             println!(
                 "node {} is in farm {} which does not exist anymore",
-                receipt.node_id, receipt.farm_id
+                node.id, node.farm_id
             );
             continue;
         };
-        let stellar_address = if let Some(stellar_address) = payout_addresses.get(&receipt.farm_id)
-        {
+        let stellar_address = if let Some(stellar_address) = payout_addresses.get(&node.farm_id) {
             &stellar_address
         } else {
             ""
@@ -1063,34 +834,54 @@ async fn main() {
             node.farm_id,
             node_start,
             node_end,
-            receipt.measured_uptime,
-            format_args!("{:.6}", cu ),
-            format_args!("{:.6}", su ),
-            format_args!("{:.6}", nu ),
+            node.uptime(period),
+            format_args!("{}.{:06}", cu / ONE_MILL as u64, cu % ONE_MILL as u64),
+            format_args!("{}.{:06}", su / ONE_MILL as u64, su % ONE_MILL as u64),
+            format_args!("{}.{:06}", nu / ONE_MILL as u64, nu % ONE_MILL as u64),
             format_args!("{}.{:03}", musd / 1_000, musd % 1_000),
             format_args!("{}.{:07}", tft / UNITS_PER_TFT, tft % UNITS_PER_TFT),
             format_args!(
                 "{}.{:03}",
-                receipt.tft_connection_price / 1_000,
-                receipt.tft_connection_price % 1_000
+                node.connection_price / 1_000,
+                node.connection_price % 1_000
             ),
             format_args!("{}.{:03}", co_musd / 1_000, co_musd % 1_000),
             format_args!("{}.{:07}", co_tft / UNITS_PER_TFT, co_tft % UNITS_PER_TFT),
-            receipt.resource_units.cru,
-            cru_used,
-            receipt.resource_units.mru,
-            mru_used,
-            receipt.resource_units.hru,
-            hru_used,
-            receipt.resource_units.sru,
-            sru_used,
-            ip_used,
-            receipt.node_type,
+            node.resources.cru,
+            if node.resources.cru > 0 {cru_used as f64 * 100. / node.resources.cru as f64} else { 0.},
+            node.resources.mru,
+            if node.resources.mru > 0 {mru_used as f64 * 100. / node.resources.mru as f64} else {0.},
+            node.resources.hru,
+            if node.resources.hru > 0 {hru_used as f64 * 100. / node.resources.hru as f64} else {0.},
+            node.resources.sru,
+            if node.resources.sru > 0 {sru_used as f64 * 100. / node.resources.sru as f64} else {0.},
+            node.capacity_consumption.ips as f64 / 3600.,
+            if let NodeCertification::Certified = node.certification_type {
+                "CERTIFIED"
+            } else {
+                "DIY"
+            },
             node.virtualized,
-            node.violation,
+            if let Some((lra, violation)) = node.first_uptime_violation {
+                format!("violation of uptime measurement in block {} (previous report {})", violation, lra)
+            } else {
+                "".into()
+            },
             stellar_address,
         ).unwrap();
 
+        let receipt = node.receipt(period, &farms, &payout_addresses, &farming_policies);
+        if !stellar_address.is_empty() && tft != 0 {
+            writeln!(
+                payout_file,
+                "{},{}.{:07},{}",
+                stellar_address,
+                tft / UNITS_PER_TFT,
+                tft % UNITS_PER_TFT,
+                hex::encode(receipt.hash()),
+            )
+            .unwrap();
+        }
         receipts.insert(receipt.hash(), receipt);
 
         // Count carbon TFT credits
@@ -1258,13 +1049,12 @@ struct MintingNode {
     location: Location,
     country: String,
     city: String,
-    _created: u64,
+    created: u64,
     certification_type: NodeCertification,
     // (last ping, last reported uptime, total uptime).
     uptime_info: Option<(i64, u64, u64)>,
-    // (boot time, original boot time record).
-    boot_time: Option<(i64, i64)>,
-    violation: Violation,
+    // Block where the first uptime report violation was detected, if any.
+    first_uptime_violation: Option<(i64, u32)>,
     connected: NodeConnected,
     // TFT price expressed in USD at time of connection. Price is expressed in mUSD (3 digits
     // precision). I.e. 1 USD => 1000.
@@ -1324,7 +1114,7 @@ impl MintingNode {
     ///
     /// A virtualized node (i.e. zos running in VM) won't get anything.
     fn node_payout_musd(&self, farming_policies: &BTreeMap<u32, FarmPolicy>) -> u64 {
-        if self.virtualized || self.violation.is_some() {
+        if self.virtualized || self.first_uptime_violation.is_some() {
             return 0;
         }
         let policy = farming_policies.get(&self.farming_policy_id).unwrap();
@@ -1361,7 +1151,7 @@ impl MintingNode {
     ///
     /// A virtualized node is garbage so that does not receive anything.
     fn node_carbon_musd(&self) -> u64 {
-        if self.virtualized || self.violation.is_some() {
+        if self.virtualized || self.first_uptime_violation.is_some() {
             return 0;
         }
         let (cu, su, _) = self.cloud_units_permill();
@@ -1475,6 +1265,14 @@ impl MintingNode {
         }
     }
 
+    /// Indicates if a node managed to achieve it's SLA in a period.
+    ///
+    /// Currently SLA is the same for all nodes, this might change in the future.
+    fn sla_achieved(&self, period: Period) -> bool {
+        let scaled_period = self.real_period(period);
+        self.uptime(scaled_period) * 100 / scaled_period.duration() >= UPTIME_SLA_PERCENT
+    }
+
     /// Get the adjusted uptime of the node
     fn uptime(&self, period: Period) -> u64 {
         let period_duration = self.real_period(period).duration();
@@ -1553,7 +1351,7 @@ impl MintingNode {
 }
 
 struct Contract {
-    _contract_id: u64,
+    contract_id: u64,
     node_id: u32,
     // timestamp of last report. If not set, time when the contract was created.
     last_report_ts: i64,
@@ -1586,21 +1384,6 @@ pub async fn get_nodes(
         }
     }
     Ok(nodes)
-}
-
-pub async fn get_twins(
-    client: &dyn RuntimeClient,
-    block: u32,
-) -> Result<Vec<Twin>, Box<dyn std::error::Error>> {
-    let hash = client.hash_at_height(Some(block)).await?;
-    let twin_count = client.twin_count(hash).await?;
-    let mut twins = Vec::new();
-    for i in 1..=twin_count {
-        if let Some(twin) = client.twin(i, hash).await? {
-            twins.push(twin);
-        }
-    }
-    Ok(twins)
 }
 
 pub async fn get_farms(
