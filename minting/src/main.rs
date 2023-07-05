@@ -613,6 +613,7 @@ async fn main() {
                             }
                         }
                     }
+                    node_power.state = psc.power_state;
                 }
             }
         }
