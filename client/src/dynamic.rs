@@ -1,5 +1,4 @@
 use crate::client::RuntimeClient;
-use crate::runtimes::v131::types::{V131PowerStateChangedEvent, V131PowerTargetChangedEvent};
 use crate::runtimes::{
     v115::types::{
         V115Contract, V115ContractCreatedEvent, V115ContractNruConsumptionReceivedEvent,
@@ -15,7 +14,15 @@ use crate::runtimes::{
         V131Contract, V131ContractCreatedEvent, V131ContractNruConsumptionReceivedEvent,
         V131ContractResources, V131ContractUpdatedResourcesEvent, V131Farm, V131FarmingPolicy,
         V131Node, V131NodePower, V131NodeStoredEvent, V131NodeUpdatedEvent,
-        V131NodeUptimeReportedEvent, V131Twin,
+        V131NodeUptimeReportedEvent, V131PowerStateChangedEvent, V131PowerTargetChangedEvent,
+        V131Twin,
+    },
+    v141::types::{
+        V141Contract, V141ContractCreatedEvent, V141ContractNruConsumptionReceivedEvent,
+        V141ContractResources, V141ContractUpdatedResourcesEvent, V141Farm, V141FarmingPolicy,
+        V141Node, V141NodePower, V141NodeStoredEvent, V141NodeUpdatedEvent,
+        V141NodeUptimeReportedEvent, V141PowerStateChangedEvent, V141PowerTargetChangedEvent,
+        V141Twin,
     },
 };
 use crate::types::{
@@ -109,6 +116,8 @@ impl RuntimeClient for DynamicClient {
                         events.push(RuntimeEvents::NodeStoredEvent(evt.0.into()));
                     } else if let Ok(Some(evt)) = evt.as_event::<V131NodeStoredEvent>() {
                         events.push(RuntimeEvents::NodeStoredEvent(evt.0.into()));
+                    } else if let Ok(Some(evt)) = evt.as_event::<V141NodeStoredEvent>() {
+                        events.push(RuntimeEvents::NodeStoredEvent(evt.0.into()));
                     };
                 }
                 (TFGRID_MODULE, NODE_UPDATED) => {
@@ -118,6 +127,8 @@ impl RuntimeClient for DynamicClient {
                         events.push(RuntimeEvents::NodeUpdatedEvent(evt.0.into()));
                     } else if let Ok(Some(evt)) = evt.as_event::<V131NodeUpdatedEvent>() {
                         events.push(RuntimeEvents::NodeUpdatedEvent(evt.0.into()));
+                    } else if let Ok(Some(evt)) = evt.as_event::<V141NodeUpdatedEvent>() {
+                        events.push(RuntimeEvents::NodeUpdatedEvent(evt.0.into()));
                     };
                 }
                 (TFGRID_MODULE, NODE_UPTIME_REPORTED) => {
@@ -126,6 +137,8 @@ impl RuntimeClient for DynamicClient {
                     } else if let Ok(Some(evt)) = evt.as_event::<V123NodeUptimeReportedEvent>() {
                         events.push(RuntimeEvents::NodeUptimeReported(evt.0, evt.1, evt.2));
                     } else if let Ok(Some(evt)) = evt.as_event::<V131NodeUptimeReportedEvent>() {
+                        events.push(RuntimeEvents::NodeUptimeReported(evt.0, evt.1, evt.2));
+                    } else if let Ok(Some(evt)) = evt.as_event::<V141NodeUptimeReportedEvent>() {
                         events.push(RuntimeEvents::NodeUptimeReported(evt.0, evt.1, evt.2));
                     };
                 }
@@ -138,6 +151,10 @@ impl RuntimeClient for DynamicClient {
                         events.push(RuntimeEvents::ContractUsedResourcesUpdated(evt.0.into()));
                     } else if let Ok(Some(evt)) =
                         evt.as_event::<V131ContractUpdatedResourcesEvent>()
+                    {
+                        events.push(RuntimeEvents::ContractUsedResourcesUpdated(evt.0.into()));
+                    } else if let Ok(Some(evt)) =
+                        evt.as_event::<V141ContractUpdatedResourcesEvent>()
                     {
                         events.push(RuntimeEvents::ContractUsedResourcesUpdated(evt.0.into()));
                     };
@@ -154,6 +171,10 @@ impl RuntimeClient for DynamicClient {
                         evt.as_event::<V131ContractNruConsumptionReceivedEvent>()
                     {
                         events.push(RuntimeEvents::NruConsumptionReceived(evt.0.into()));
+                    } else if let Ok(Some(evt)) =
+                        evt.as_event::<V141ContractNruConsumptionReceivedEvent>()
+                    {
+                        events.push(RuntimeEvents::NruConsumptionReceived(evt.0.into()));
                     };
                 }
                 (SMART_CONTRACT_MODULE, CONTRACT_CREATED) => {
@@ -163,15 +184,21 @@ impl RuntimeClient for DynamicClient {
                         events.push(RuntimeEvents::ContractCreated(evt.0.into()));
                     } else if let Ok(Some(evt)) = evt.as_event::<V131ContractCreatedEvent>() {
                         events.push(RuntimeEvents::ContractCreated(evt.0.into()));
+                    } else if let Ok(Some(evt)) = evt.as_event::<V141ContractCreatedEvent>() {
+                        events.push(RuntimeEvents::ContractCreated(evt.0.into()));
                     };
                 }
                 (TFGRID_MODULE, POWER_STATE_CHANGED) => {
                     if let Ok(Some(evt)) = evt.as_event::<V131PowerStateChangedEvent>() {
                         events.push(RuntimeEvents::PowerStateChanged(evt.into()));
+                    } else if let Ok(Some(evt)) = evt.as_event::<V141PowerStateChangedEvent>() {
+                        events.push(RuntimeEvents::PowerStateChanged(evt.into()));
                     };
                 }
                 (TFGRID_MODULE, POWER_TARGET_CHANGED) => {
                     if let Ok(Some(evt)) = evt.as_event::<V131PowerTargetChangedEvent>() {
+                        events.push(RuntimeEvents::PowerTargetChanged(evt.into()));
+                    } else if let Ok(Some(evt)) = evt.as_event::<V141PowerTargetChangedEvent>() {
                         events.push(RuntimeEvents::PowerTargetChanged(evt.into()));
                     };
                 }
@@ -238,6 +265,8 @@ impl RuntimeClient for DynamicClient {
             Ok(Some(twin.into()))
         } else if let Ok(twin) = codec::decode_from_bytes::<V131Twin>(r.clone().into()) {
             Ok(Some(twin.into()))
+        } else if let Ok(twin) = codec::decode_from_bytes::<V141Twin>(r.clone().into()) {
+            Ok(Some(twin.into()))
         } else {
             return Err(Error::ErrorDecodingTwin.into());
         }
@@ -286,6 +315,8 @@ impl RuntimeClient for DynamicClient {
         } else if let Ok(farm) = codec::decode_from_bytes::<V123Farm>(r.clone().into()) {
             Ok(Some(farm.into()))
         } else if let Ok(farm) = codec::decode_from_bytes::<V131Farm>(r.clone().into()) {
+            Ok(Some(farm.into()))
+        } else if let Ok(farm) = codec::decode_from_bytes::<V141Farm>(r.clone().into()) {
             Ok(Some(farm.into()))
         } else {
             return Err(Error::ErrorDecodingFarm.into());
@@ -364,6 +395,8 @@ impl RuntimeClient for DynamicClient {
             Ok(Some(node.into()))
         } else if let Ok(node) = codec::decode_from_bytes::<V131Node>(r.clone().into()) {
             Ok(Some(node.into()))
+        } else if let Ok(node) = codec::decode_from_bytes::<V141Node>(r.clone().into()) {
+            Ok(Some(node.into()))
         } else {
             return Err(Error::ErrorDecodingNode.into());
         }
@@ -416,6 +449,8 @@ impl RuntimeClient for DynamicClient {
             Ok(Some(contract.into()))
         } else if let Ok(contract) = codec::decode_from_bytes::<V131Contract>(r.clone().into()) {
             Ok(Some(contract.into()))
+        } else if let Ok(contract) = codec::decode_from_bytes::<V141Contract>(r.clone().into()) {
+            Ok(Some(contract.into()))
         } else {
             return Err(Error::ErrorDecodingContract.into());
         }
@@ -454,6 +489,10 @@ impl RuntimeClient for DynamicClient {
             Ok(Some(contract.into()))
         } else if let Ok(contract) =
             codec::decode_from_bytes::<V131ContractResources>(r.clone().into())
+        {
+            Ok(Some(contract.into()))
+        } else if let Ok(contract) =
+            codec::decode_from_bytes::<V141ContractResources>(r.clone().into())
         {
             Ok(Some(contract.into()))
         } else {
@@ -508,6 +547,8 @@ impl RuntimeClient for DynamicClient {
             Ok(Some(policy.into()))
         } else if let Ok(policy) = codec::decode_from_bytes::<V131FarmingPolicy>(r.clone().into()) {
             Ok(Some(policy.into()))
+        } else if let Ok(policy) = codec::decode_from_bytes::<V141FarmingPolicy>(r.clone().into()) {
+            Ok(Some(policy.into()))
         } else {
             return Err(Error::ErrorDecodingFarmingPolicy.into());
         }
@@ -555,6 +596,8 @@ impl RuntimeClient for DynamicClient {
         let r: Vec<u8> = result.unwrap().into_encoded().into();
 
         if let Ok(node_power) = codec::decode_from_bytes::<V131NodePower>(r.into()) {
+            Ok(Some(node_power.into()))
+        } else if let Ok(node_power) = codec::decode_from_bytes::<V141NodePower>(r.into()) {
             Ok(Some(node_power.into()))
         } else {
             return Err(Error::ErrorDecodingFarmingPolicy.into());
