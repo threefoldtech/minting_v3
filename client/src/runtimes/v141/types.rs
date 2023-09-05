@@ -1,4 +1,5 @@
 use super::runtime::api::runtime_types::{
+    bounded_collections::bounded_vec::BoundedVec,
     pallet_smart_contract::types::{
         Cause as RuntimeCause, Contract as RuntimeContract, ContractData as RuntimeContractData,
         ContractResources as RuntimeContractResources, ContractState as RuntimeContractState,
@@ -17,7 +18,6 @@ use super::runtime::api::runtime_types::{
             Twin as RuntimeTwin,
         },
     },
-    sp_core::bounded::bounded_vec::BoundedVec,
     tfchain_support::resources::Resources as RuntimeResources,
     tfchain_support::types::{
         Farm as RuntimeFarm, FarmCertification as RuntimeFarmCertification,
