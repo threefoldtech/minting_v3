@@ -595,7 +595,7 @@ impl RuntimeClient for DynamicClient {
 
         let r: Vec<u8> = result.unwrap().into_encoded().into();
 
-        if let Ok(node_power) = codec::decode_from_bytes::<V131NodePower>(r.into()) {
+        if let Ok(node_power) = codec::decode_from_bytes::<V131NodePower>(r.clone().into()) {
             Ok(Some(node_power.into()))
         } else if let Ok(node_power) = codec::decode_from_bytes::<V141NodePower>(r.into()) {
             Ok(Some(node_power.into()))
