@@ -593,7 +593,7 @@ impl RuntimeClient for DynamicClient {
             return Ok(None);
         }
 
-        let r = result.unwrap().into_encoded().into();
+        let r = result.unwrap().into_encoded();
 
         if let Ok(node_power) = codec::decode_from_bytes::<V131NodePower>(r.clone().into()) {
             Ok(Some(node_power.into()))
