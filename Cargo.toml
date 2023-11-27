@@ -1,8 +1,8 @@
 [profile.release]
 panic = 'unwind'
+codegen-units = 1
+lto = "fat"
+opt-level = 3
 
 [workspace]
-members = [
-    'client',
-    'minting',
-]
+members = ['client', 'minting']
