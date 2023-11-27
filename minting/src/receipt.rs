@@ -182,6 +182,7 @@ pub struct FixupReceipt {
 
 impl FixupReceipt {
     /// Get the hash of the receipt.
+    #[allow(dead_code)]
     pub fn hash(&self) -> [u8; 32] {
         let out = serde_json::to_vec(&self).unwrap();
         let mut hasher = Blake2b256::new();

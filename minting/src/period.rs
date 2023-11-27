@@ -22,6 +22,7 @@ pub struct Period {
 
 impl Period {
     /// Get the current payment cycle.
+    #[allow(dead_code)]
     pub fn current() -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -59,6 +60,7 @@ impl Period {
     }
 
     /// Indicates if a given timestamp is part of the period or not.
+    #[allow(dead_code)]
     pub fn timestamp_in_period(&self, ts: i64) -> bool {
         ts >= self.start && ts <= self.end
     }
