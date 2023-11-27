@@ -6,3 +6,4 @@ opt-level = 3
 
 [workspace]
 members = ['client', 'minting']
+resolver = "2"
