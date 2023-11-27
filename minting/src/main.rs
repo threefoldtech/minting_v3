@@ -455,8 +455,10 @@ async fn main() {
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, total_uptime));
                             // Also mark a boot
-                            node.boot_time =
-                                Some(((current_time - reported_uptime) as i64, current_time as i64));
+                            node.boot_time = Some((
+                                (current_time - reported_uptime) as i64,
+                                current_time as i64,
+                            ));
                         }
                     } else {
                         if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
@@ -738,7 +740,7 @@ async fn main() {
         }
 
         // finally update progress bar
-        bar.set_message(Utc.timestamp(ts as i64, 0).to_rfc2822());
+        bar.set_message(Utc.timestamp_opt(ts as i64, 0).unwrap().to_rfc2822());
         bar.inc(1);
 
         height += 1;
@@ -959,7 +961,7 @@ async fn main() {
             }
         }
 
-        bar.set_message(Utc.timestamp(ts as i64, 0).to_rfc2822());
+        bar.set_message(Utc.timestamp_opt(ts as i64, 0).unwrap().to_rfc2822());
         bar.inc(1);
 
         height += 1;
@@ -1026,8 +1028,8 @@ async fn main() {
 
         //let node_period = node.real_period(period);
         let node_period = receipt.period;
-        let node_start = Utc.timestamp(node_period.start(), 0);
-        let node_end = Utc.timestamp(node_period.end(), 0);
+        let node_start = Utc.timestamp_opt(node_period.start(), 0).unwrap();
+        let node_end = Utc.timestamp_opt(node_period.end(), 0).unwrap();
         let CloudUnits { cu, su, nu } = receipt.cloud_units;
         let Reward { musd, tft } = receipt.reward;
         let Reward {

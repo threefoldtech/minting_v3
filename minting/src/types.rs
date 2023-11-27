@@ -469,7 +469,8 @@ impl Display for Node {
         writeln!(
             f,
             "Created at: {}",
-            Utc.timestamp(self.created as i64, 0)
+            Utc.timestamp_opt(self.created as i64, 0)
+                .unwrap()
                 .with_timezone(&Local)
                 .to_rfc2822()
         )?;
