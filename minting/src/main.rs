@@ -104,6 +104,9 @@ const HORIZON_URL: &str = "https://horizon.stellar.org";
 /// Maximum amount of seconds a node can be offline because of the power managment feature while
 /// still getting rewards.
 const MAX_POWER_MANAGER_DOWNTIME: u64 = 60 * 60 * 24;
+/// Maximum amount of seconds a node has before it needs to be booted as result of a farmer bot
+/// power up request.
+const MAX_POWER_MANAGER_BOOT_TIME: i64 = 60 * 30;
 
 #[tokio::main]
 async fn main() {
@@ -229,6 +232,7 @@ async fn main() {
                     virtualized: node.virtualized,
                     farming_policy_id: node.farming_policy_id,
                     power_managed: None,
+                    power_manage_boot: None,
                 },
             )
         })
@@ -364,6 +368,7 @@ async fn main() {
                             virtualized: node.virtualized,
                             farming_policy_id: node.farming_policy_id,
                             power_managed: None,
+                            power_manage_boot: None,
                         },
                     );
                     power_states.insert(
@@ -449,6 +454,22 @@ async fn main() {
                                     total_uptime += time_delta as u64;
                                 }
                             }
+                            // Speaking of time, node needs to be booted within the allotted time
+                            // frame.
+                            // Use Option::take here so we always leave a None value.
+                            if let Some(boot_request) = node.power_manage_boot.take() {
+                                if (current_time - reported_uptime) as i64 - boot_request
+                                    > MAX_POWER_MANAGER_BOOT_TIME
+                                {
+                                    // Node took to long to boot.
+                                    if node.violation.is_none() {
+                                        node.violation = Violation::BootRequestExpired {
+                                            requested: boot_request,
+                                            booted: Some((current_time - reported_uptime) as _),
+                                        }
+                                    }
+                                }
+                            }
                             // Clear the fact that we got power managed, if it is still the case, it
                             // will be set again in the proper event handler.
                             node.power_managed = None;
@@ -469,7 +490,7 @@ async fn main() {
                             // There are quite some situations here. Notice that due to the
                             // blockchain only producing blocks every 6 seconds, and network delay
                             // + a host of other issues, we will allow a node to report uptime with
-                            // "grace period" of a couple of minutes or so in either direction.
+                            // "grace period" of a minute or so in either direction.
                             //
                             // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
                             //    rubish.
@@ -680,13 +701,33 @@ async fn main() {
                             ptc.node_id, height
                         ),
                     };
+                    // Remember a rising edge here to validate node actually boots.
+                    // This is cleared when a node sends an uptime report of a _reboot_. It is
+                    // allowed for this to happen if a rising edge is not consumed yet, in which
+                    // case the new event is ignored, as we want to measure time from the first
+                    // event and it is actually a good idea to send multiple of these if the node
+                    // does not react. Of course, we also only want to track this if the node is
+                    // currently power managed. While we shouldn't try to boot an online node,
+                    // there is no _real_ harm in doing it anyway.
+                    if ptc.power_target == Power::Up
+                        && matches!(node_power.state, PowerState::Down(_))
+                    {
+                        if let Some(node) = nodes.get_mut(&ptc.node_id) {
+                            node.power_manage_boot = Some(ts);
+                        } else {
+                            panic!(
+                                "can't change power target for unknown node {} in block {}",
+                                ptc.node_id, height
+                            );
+                        }
+                    }
                     node_power.target = ptc.power_target;
                 }
                 RuntimeEvents::PowerStateChanged(psc) => {
                     let node_power = match power_states.get_mut(&psc.node_id) {
                         Some(ps) => ps,
                         None => panic!(
-                            "can't change power target for unknown node {} in block {}",
+                            "can't change power state for unknown node {} in block {}",
                             psc.node_id, height
                         ),
                     };
@@ -809,6 +850,23 @@ async fn main() {
                                 "uptime event must be sent after node wen't down, chronology"
                             );
                             total_uptime += uptime_diff as u64;
+                        }
+
+                        // Speaking of time, node needs to be booted within the allotted time
+                        // frame.
+                        // Use Option::take here so we always leave a None value.
+                        if let Some(boot_request) = node.power_manage_boot.take() {
+                            if (current_time - reported_uptime) as i64 - boot_request
+                                > MAX_POWER_MANAGER_BOOT_TIME
+                            {
+                                // Node took to long to boot.
+                                if node.violation.is_none() {
+                                    node.violation = Violation::BootRequestExpired {
+                                        requested: boot_request,
+                                        booted: Some((current_time - reported_uptime) as _),
+                                    }
+                                }
+                            }
                         }
                         // Clear the fact that we got power managed, if it is still the case, it
                         // will be set again in the proper event handler.
@@ -971,6 +1029,22 @@ async fn main() {
         }
     }
     bar.finish_and_clear();
+
+    // At this point we are done fetching events. Note that for the case of power manager boot
+    // requests, we haven't checked the case where the node does not respond at all. We already
+    // fetched a days worth of blocks after the period ended, and don't keep track of power on
+    // requests there. So any leftover requests here are already a day old, which is way too much.
+    // So if any node has an outstanding power on request here, stick them with a violation.
+    for (_, node) in nodes.iter_mut() {
+        if let Some(boot_request) = node.power_manage_boot {
+            if node.violation.is_none() {
+                node.violation = Violation::BootRequestExpired {
+                    requested: boot_request,
+                    booted: None,
+                }
+            }
+        }
+    }
 
     // Check twin relays and public keys
     for (_, node) in nodes.iter_mut() {
@@ -1278,6 +1352,10 @@ struct MintingNode {
     farming_policy_id: u32,
     // Timestamp the node changed powerstate to down, before a new uptime was posted.
     power_managed: Option<i64>,
+    /// Time the last power manage target changed to up. We keep track of this to make sure we
+    /// always have a node go up after target is set to up (i.e. farmerbot powers on a node).
+    /// Cleared when node boots.
+    power_manage_boot: Option<i64>,
 }
 
 impl MintingNode {
