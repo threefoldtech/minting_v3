@@ -984,14 +984,20 @@ async fn main() {
                         && matches!(node_power.state, PowerState::Down(_))
                     {
                         if let Some(node) = nodes.get_mut(&ptc.node_id) {
-                            node.power_manage_boot = Some(ts);
-                            log_file
-                                .write_all(
-                                    format!("Remembered boot request time for node {}\n", node.id)
+                            // Only remember the first boot request.
+                            if node.power_manage_boot.is_none() {
+                                node.power_manage_boot = Some(ts);
+                                log_file
+                                    .write_all(
+                                        format!(
+                                            "Remembered boot request time for node {}\n",
+                                            node.id
+                                        )
                                         .as_bytes(),
-                                )
-                                .await
-                                .unwrap();
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
                         } else {
                             panic!(
                                 "can't change power target for unknown node {} in block {}",
