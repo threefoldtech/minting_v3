@@ -21,7 +21,7 @@ use tfchain_client::{
         NodeCertification, NodePower, Power, PowerState, Resources, RuntimeEvents, Twin,
     },
 };
-use tokio::sync::mpsc;
+use tokio::{io::AsyncWriteExt, sync::mpsc};
 
 mod period;
 mod receipt;
@@ -110,17 +110,29 @@ const MAX_POWER_MANAGER_BOOT_TIME: i64 = 60 * 30;
 
 #[tokio::main]
 async fn main() {
-    // TODO: use `clap` to properly have flags for this
-    // let network = Network::Test;
     let mut args = std::env::args();
     // ignore binary name
     args.next();
+
+    let mut log_file = tokio::fs::File::create("minting_log.txt").await.unwrap();
 
     let period_offset = args.next().unwrap().parse().unwrap();
     let period = Period::at_offset(period_offset);
     let start_ts: i64 = period.start();
     let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
+
+    log_file
+        .write_all(
+            format!(
+                "Start minting for period {period_offset} starting at {} and ending at {}\n",
+                Utc.timestamp_opt(start_ts, 0).unwrap().to_rfc2822(),
+                Utc.timestamp_opt(end_ts, 0).unwrap().to_rfc2822(),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
 
     // load previous receipts
     let previous_period_offset = period_offset - 1;
@@ -149,6 +161,17 @@ async fn main() {
             }
         }
     }
+
+    log_file
+        .write_all(
+            format!(
+                "Loaded {} receipts from previous period\n",
+                previous_receipts.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
 
     // load previous fixup receipts
     println!(
@@ -183,6 +206,17 @@ async fn main() {
         }
     }
 
+    log_file
+        .write_all(
+            format!(
+                "Loaded {} fixup receipts from previous period\n",
+                previous_fixup_receipts.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
     if previous_receipts.len() > 0 || previous_fixup_receipts.len() > 0 {
         println!(
             "Filtering receipts, pre filter length {}",
@@ -198,12 +232,30 @@ async fn main() {
         );
     }
 
+    log_file
+        .write_all(
+            format!(
+                "Filtered paid receipts, {} (fixup) receipts from previous period not paid yet\n",
+                previous_receipts.len() + previous_fixup_receipts.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
     let client = DynamicClient::new(&wss_url).await.unwrap();
 
     println!("Finding start block");
     let start_block = height_at_timestamp(&client, start_ts).await.unwrap();
     println!("Finding end block");
     let end_block = height_at_timestamp(&client, end_ts).await.unwrap();
+
+    log_file
+        .write_all(
+            format!("Period runs from block {start_block} to block {end_block}\n",).as_bytes(),
+        )
+        .await
+        .unwrap();
 
     // Grab existing nodes
     let mut nodes: BTreeMap<_, _> = get_nodes(&client, start_block)
@@ -239,12 +291,22 @@ async fn main() {
         .collect();
     println!("Found {} existing nodes", nodes.len());
 
+    log_file
+        .write_all(format!("Loaded {} existing nodes\n", nodes.len()).as_bytes())
+        .await
+        .unwrap();
+
     let mut power_states: BTreeMap<_, _> = get_power_states(&client, start_block)
         .await
         .unwrap()
         .into_iter()
         .collect();
     println!("Found {} power states", power_states.len());
+
+    log_file
+        .write_all(format!("Loaded {} power states\n", power_states.len()).as_bytes())
+        .await
+        .unwrap();
 
     // Insert missing entries for power state, and update node power managed if it currently is
     // power managed.
@@ -281,6 +343,11 @@ async fn main() {
         .collect();
     println!("Found {} existing farms", farms.len());
 
+    log_file
+        .write_all(format!("Loaded {} farms, at the end of the period\n", farms.len()).as_bytes())
+        .await
+        .unwrap();
+
     let twins: BTreeMap<_, _> = get_twins(&client, end_block)
         .await
         .unwrap()
@@ -289,9 +356,26 @@ async fn main() {
         .collect();
     println!("Found {} existing twins", twins.len());
 
+    log_file
+        .write_all(format!("Loaded {} twins, at the end of the period\n", twins.len()).as_bytes())
+        .await
+        .unwrap();
+
     let payout_addresses: BTreeMap<_, _> = get_payout_addresses(&client, &farms, end_block)
         .await
         .unwrap();
+
+    log_file
+        .write_all(
+            format!(
+                "Loaded {} payout addresses, at the end of the period\n",
+                payout_addresses.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
     // Grab existing contracts
     let mut contracts: BTreeMap<_, _> = get_contracts(&client, start_block)
         .await
@@ -318,6 +402,11 @@ async fn main() {
         .collect();
     println!("Found {} existing contracts", contracts.len());
 
+    log_file
+        .write_all(format!("Loaded {} existing contracts\n", contracts.len()).as_bytes())
+        .await
+        .unwrap();
+
     // Get farming policies
     let farming_policies: BTreeMap<_, _> = get_farming_policies(&client, end_block)
         .await
@@ -327,9 +416,19 @@ async fn main() {
         .collect();
     println!("Found {} farming policies", farming_policies.len());
 
+    log_file
+        .write_all(
+            format!(
+                "Loaded {} farming policies, at the end of the period\n",
+                farming_policies.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
     println!("Setup block import pipeline");
     let blocks = end_block - start_block + 1;
-    //let block_stream = block_import(client.clone(), start_block, end_block, network);
 
     let bar = ProgressBar::new(blocks as u64);
     bar.set_style(
@@ -339,11 +438,26 @@ async fn main() {
     let mut height = start_block;
     let mut import_queue = block_import(&wss_url, height as usize, end_block as usize).await;
     loop {
-        let (ts, evts) = if let Some((ts, evts)) = import_queue.recv().await {
-            (ts, evts)
-        } else {
-            panic!("Block import exitted too early");
-        };
+        let (block_height, ts, evts) =
+            if let Some((block_height, ts, evts)) = import_queue.recv().await {
+                (block_height, ts, evts)
+            } else {
+                panic!("Block import exitted too early");
+            };
+
+        log_file
+            .write_all(
+                format!(
+                    "Loaded block {} ({}) containing {} events\n",
+                    block_height,
+                    Utc.timestamp_opt(end_ts, 0).unwrap().to_rfc2822(),
+                    evts.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
         for evt in evts.into_iter() {
             match evt {
                 RuntimeEvents::NodeStoredEvent(node) => {
@@ -378,6 +492,10 @@ async fn main() {
                             target: Power::Up,
                         },
                     );
+                    log_file
+                        .write_all(format!("New node stored with id {}\n", node.id).as_bytes())
+                        .await
+                        .unwrap();
                 }
                 RuntimeEvents::NodeUpdatedEvent(node) => {
                     let old_node = nodes
@@ -421,6 +539,11 @@ async fn main() {
                     if node.virtualized {
                         old_node.virtualized = node.virtualized;
                     }
+
+                    log_file
+                        .write_all(format!("Node updated with id {}\n", node.id).as_bytes())
+                        .await
+                        .unwrap();
                 }
                 RuntimeEvents::NodeUptimeReported(id, current_time, reported_uptime) => {
                     let node = match nodes.get_mut(&id) {
@@ -450,9 +573,35 @@ async fn main() {
                                 // Check and scale to match the actual period start if needed
                                 if time_set_down < start_ts {
                                     total_uptime += (current_time as i64 - start_ts) as u64;
+                                    log_file
+                                        .write_all(
+                                            format!(
+                                                "Added {} seconds of uptime for node {}, scaled in period start\n",
+                                                current_time as i64 - start_ts,
+                                                node.id
+                                            )
+                                            .as_bytes(),
+                                        )
+                                        .await
+                                        .unwrap();
                                 } else {
                                     total_uptime += time_delta as u64;
+                                    log_file
+                                        .write_all(
+                                            format!(
+                                                "Added {time_delta} seconds of uptime for node {}\n",
+                                                node.id
+                                            )
+                                            .as_bytes(),
+                                        )
+                                        .await
+                                        .unwrap();
                                 }
+                            } else {
+                                log_file
+                                .write_all(format!("Refusing to credit uptime for power managed node {} as the last boot was {time_delta} seconds ago, more than the allowed 24 hours\n", node.id).as_bytes())
+                                .await
+                                .unwrap();
                             }
                             // Speaking of time, node needs to be booted within the allotted time
                             // frame.
@@ -466,7 +615,16 @@ async fn main() {
                                         node.violation = Violation::BootRequestExpired {
                                             requested: boot_request,
                                             booted: Some((current_time - reported_uptime) as _),
-                                        }
+                                        };
+
+                                        log_file
+                                            .write_all(format!("Detected farmer bot boot violation for node {}, request was done at {} but node only came online at {}\n",
+                                                node.id,
+                                                Utc.timestamp_opt(boot_request, 0).unwrap().to_rfc2822(),
+                                                Utc.timestamp_opt((current_time - reported_uptime) as i64, 0).unwrap().to_rfc2822()
+                                            ).as_bytes())
+                                            .await
+                                            .unwrap();
                                     }
                                 }
                             }
@@ -480,6 +638,11 @@ async fn main() {
                                 (current_time - reported_uptime) as i64,
                                 current_time as i64,
                             ));
+                        } else {
+                            log_file
+                                .write_all(format!("Ignoring uptime event for node {} as it happened before the node powered down after being requested to do so\n", node.id).as_bytes())
+                                .await
+                                .unwrap();
                         }
                     } else {
                         if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
@@ -506,6 +669,11 @@ async fn main() {
                                 }
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
+
+                                log_file
+                                    .write_all(format!("Node {} reported an uptime increase of {uptime_delta} seconds, while reports are {report_delta} seconds appart\n",node.id,).as_bytes())
+                                    .await
+                                    .unwrap();
                                 continue;
                             }
                             // 2. The difference in uptime is within reason of the difference in
@@ -526,6 +694,11 @@ async fn main() {
                                                 reported_timestamp: current_time as i64,
                                             };
                                         }
+
+                                        log_file
+                                            .write_all(format!("Node {} has a detected clock skew of {} seconds, more than the allowed {CLOCK_SKEW_INTERVAL} seconds\n",node.id, (new_boot - boot).abs()).as_bytes())
+                                            .await
+                                            .unwrap();
                                     }
                                 } else {
                                     panic!("node does not have boot time but does have uptime")
@@ -541,12 +714,24 @@ async fn main() {
                                     // That being said, we also limit the amount of uptime credit
                                     // to the uptime report interval + grace period, as healthy
                                     // nodes _must_ ping every interval amount of time
-                                    total_uptime += u64::min(
+                                    let credit = u64::min(
                                         uptime_delta as u64,
                                         (NODE_UPTIME_REPORT_INTERVAL_SECONDS
                                             + UPTIME_GRACE_PERIOD_SECONDS)
                                             as u64,
                                     );
+                                    total_uptime += credit;
+                                    if credit != uptime_delta as u64 {
+                                        log_file
+                                            .write_all(format!("Creditted node {} with {credit} seconds of uptime, less than the reported {uptime_delta} seconds as the gap is too big\n", node.id).as_bytes())
+                                            .await
+                                            .unwrap();
+                                    } else {
+                                        log_file
+                                            .write_all(format!("Creditted node {} with {credit} seconds of reported uptime\n", node.id).as_bytes())
+                                            .await
+                                            .unwrap();
+                                    }
                                     node.uptime_info =
                                         Some((current_time as i64, reported_uptime, total_uptime));
                                     continue;
@@ -559,12 +744,24 @@ async fn main() {
                             //
                             //    1. Uptime is within bounds.
                             if reported_uptime as i64 <= report_delta {
-                                total_uptime += u64::min(
+                                let credit = u64::min(
                                     reported_uptime,
                                     (NODE_UPTIME_REPORT_INTERVAL_SECONDS
                                         + UPTIME_GRACE_PERIOD_SECONDS)
                                         as u64,
                                 );
+                                total_uptime += credit;
+                                if reported_uptime != credit {
+                                    log_file
+                                        .write_all(format!("Creditted node {} with {credit} seconds of uptime after a reboot, less than the reported {uptime_delta} seconds as the gap is too big\n", node.id).as_bytes())
+                                        .await
+                                        .unwrap();
+                                } else {
+                                    log_file
+                                        .write_all(format!("Creditted node {} with {credit} seconds of reported uptime after a reboot\n", node.id).as_bytes())
+                                        .await
+                                        .unwrap();
+                                }
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
                                 node.boot_time = Some((
@@ -587,6 +784,10 @@ async fn main() {
                                         reported_timestamp: ts,
                                         block_reported: height,
                                     };
+                                    log_file
+                                        .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, so time would have advanced slower on the node than in the universe\n", node.id).as_bytes())
+                                        .await
+                                        .unwrap();
                                 }
                                 continue;
                             }
@@ -598,7 +799,11 @@ async fn main() {
                                     reported_uptime,
                                     reported_timestamp: ts,
                                     block_reported: height,
-                                }
+                                };
+                                log_file
+                                    .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, so time would have advanced faster on the node than in the universe\n", node.id).as_bytes())
+                                    .await
+                                    .unwrap();
                             }
                             continue;
                         } else {
@@ -611,6 +816,10 @@ async fn main() {
                                 (NODE_UPTIME_REPORT_INTERVAL_SECONDS + UPTIME_GRACE_PERIOD_SECONDS)
                                     as u64,
                             );
+                            log_file
+                                .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, scaled to {up_in_period} seconds\n", node.id).as_bytes())
+                                .await
+                                .unwrap();
                             // Save uptime info
                             node.uptime_info =
                                 Some((current_time as i64, reported_uptime, up_in_period));
@@ -630,6 +839,16 @@ async fn main() {
                         }
                     };
                     contract.resources = data.used;
+                    log_file
+                        .write_all(
+                            format!(
+                                "Update used resources for contract {}\n",
+                                contract._contract_id
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
                 }
                 RuntimeEvents::NruConsumptionReceived(data) => {
                     let contract = match contracts.get_mut(&data.contract_id) {
@@ -659,11 +878,33 @@ async fn main() {
                         // Silently ignore reports out of order, we already covered this in an
                         // already processed consumption report. This can happen if the node pushes
                         // a contract consumption report twice.
+                        log_file
+                            .write_all(
+                                format!(
+                                    "Ignoring out of order NRU consumption report for contract {} on node {}\n",
+                                    contract._contract_id,
+                                    node.id,
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
                         continue;
                     }
 
                     // If report ts predates start we ignore it.
                     if (ts as i64) < start_ts {
+                        log_file
+                            .write_all(
+                                format!(
+                                    "Ignoring NRU consumption report for contract {} on node {} which predates the period start\n",
+                                    contract._contract_id,
+                                    node.id,
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
                         continue;
                     }
                     node.capacity_consumption.cru += (contract.resources.cru * data.window) as u128;
@@ -673,6 +914,16 @@ async fn main() {
                     node.capacity_consumption.ips += contract.ips as u64 * data.window;
                     node.capacity_consumption.nru += data.nru;
                     contract.last_report_ts = ts as i64;
+                    log_file
+                        .write_all(
+                            format!(
+                                "Added NRU consumption report for contract {} on node {}\n",
+                                contract._contract_id, node.id,
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
                 }
                 RuntimeEvents::ContractCreated(contract) => {
                     if let ContractData::NodeContract(nc) = &contract.contract_type {
@@ -691,6 +942,16 @@ async fn main() {
                                 },
                             },
                         );
+                        log_file
+                            .write_all(
+                                format!(
+                                    "Created contract {} on node {}\n",
+                                    contract.contract_id, nc.node_id,
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
                     };
                 }
                 RuntimeEvents::PowerTargetChanged(ptc) => {
@@ -701,6 +962,16 @@ async fn main() {
                             ptc.node_id, height
                         ),
                     };
+                    log_file
+                        .write_all(
+                            format!(
+                                "Power target changed for node {} from {:?} to {:?}\n",
+                                ptc.node_id, node_power.target, ptc.power_target,
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
                     // Remember a rising edge here to validate node actually boots.
                     // This is cleared when a node sends an uptime report of a _reboot_. It is
                     // allowed for this to happen if a rising edge is not consumed yet, in which
@@ -714,6 +985,13 @@ async fn main() {
                     {
                         if let Some(node) = nodes.get_mut(&ptc.node_id) {
                             node.power_manage_boot = Some(ts);
+                            log_file
+                                .write_all(
+                                    format!("Remembered boot request time for node {}\n", node.id)
+                                        .as_bytes(),
+                                )
+                                .await
+                                .unwrap();
                         } else {
                             panic!(
                                 "can't change power target for unknown node {} in block {}",
@@ -731,6 +1009,16 @@ async fn main() {
                             psc.node_id, height
                         ),
                     };
+                    log_file
+                        .write_all(
+                            format!(
+                                "Power state changed for node {} from {:?} to {:?}\n",
+                                psc.node_id, node_power.state, psc.power_state,
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
                     // Add exception to allow node 1 uptime ping once it gets back on which
                     // indicates a reboot.
                     // Also, we only allow this if the target is down as well.
@@ -772,6 +1060,16 @@ async fn main() {
                                     // We can set uptime to 0, node will reboot anyway.
                                     node.uptime_info = Some((ts, 0, total_uptime));
                                 }
+                                log_file
+                                    .write_all(
+                                        format!(
+                                            "Remembered farmer bot shutdown for node {}\n",
+                                            node.id
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await
+                                    .unwrap();
                             }
                         }
                     }
@@ -809,14 +1107,24 @@ async fn main() {
     )
     .await;
     loop {
-        let (ts, evts) = if let Some((ts, evts)) = import_queue.recv().await {
-            (ts, evts)
-        } else {
-            panic!("Block import exitted too early");
-        };
-        // let hash = client.hash_at_height(Some(height)).await.unwrap();
-        // let evts = client.events(hash).await.unwrap();
-        // let ts = client.timestamp(hash).await.unwrap() / 1000;
+        let (block_height, ts, evts) =
+            if let Some((block_height, ts, evts)) = import_queue.recv().await {
+                (block_height, ts, evts)
+            } else {
+                panic!("Block import exitted too early");
+            };
+        log_file
+            .write_all(
+                format!(
+                    "Loaded block {} ({}) containing {} events\n",
+                    block_height,
+                    Utc.timestamp_opt(end_ts, 0).unwrap().to_rfc2822(),
+                    evts.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
         for evt in evts.into_iter() {
             match evt {
                 RuntimeEvents::NodeUptimeReported(id, current_time, reported_uptime) => {
@@ -850,6 +1158,16 @@ async fn main() {
                                 "uptime event must be sent after node wen't down, chronology"
                             );
                             total_uptime += uptime_diff as u64;
+                            log_file
+                                .write_all(
+                                    format!(
+                                        "Added {uptime_diff} seconds of uptime for node {}, for farmer bot boot post period\n",
+                                        node.id
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await
+                                .unwrap();
                         }
 
                         // Speaking of time, node needs to be booted within the allotted time
@@ -864,7 +1182,15 @@ async fn main() {
                                     node.violation = Violation::BootRequestExpired {
                                         requested: boot_request,
                                         booted: Some((current_time - reported_uptime) as _),
-                                    }
+                                    };
+                                    log_file
+                                        .write_all(format!("Detected farmer bot boot violation for node {}, request was done at {} but node only came online at {}\n",
+                                            node.id,
+                                            Utc.timestamp_opt(boot_request, 0).unwrap().to_rfc2822(),
+                                            Utc.timestamp_opt((current_time - reported_uptime) as i64, 0).unwrap().to_rfc2822()
+                                        ).as_bytes())
+                                        .await
+                                        .unwrap();
                                 }
                             }
                         }
@@ -909,6 +1235,10 @@ async fn main() {
                                 }
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
+                                log_file
+                                    .write_all(format!("Node {} reported an uptime increase of {uptime_delta} seconds, while reports are {report_delta} seconds appart\n",node.id,).as_bytes())
+                                    .await
+                                    .unwrap();
                                 continue;
                             }
                             // 2. The difference in uptime is within reason of the difference in
@@ -929,6 +1259,10 @@ async fn main() {
                                                 reported_timestamp: current_time as i64,
                                             };
                                         }
+                                        log_file
+                                            .write_all(format!("Node {} has a detected clock skew of {} seconds, more than the allowed {CLOCK_SKEW_INTERVAL} seconds\n",node.id, (new_boot - boot).abs()).as_bytes())
+                                            .await
+                                            .unwrap();
                                     }
                                 } else {
                                     panic!("node does not have boot time but does have uptime")
@@ -943,12 +1277,24 @@ async fn main() {
                                     // couple of seconds it will be corrected by the next pings anyhow.
                                     //
                                     // Make sure we don't add too much based on the period.
-                                    total_uptime += u64::min(
+                                    let credit = u64::min(
                                         delta_in_period as u64,
                                         (NODE_UPTIME_REPORT_INTERVAL_SECONDS
                                             + UPTIME_GRACE_PERIOD_SECONDS)
                                             as u64,
                                     );
+                                    total_uptime += credit;
+                                    if credit != delta_in_period as u64 {
+                                        log_file
+                                            .write_all(format!("Creditted node {} with {credit} seconds of uptime, less than the reported {delta_in_period} seconds as the gap is too big\n", node.id).as_bytes())
+                                            .await
+                                            .unwrap();
+                                    } else {
+                                        log_file
+                                            .write_all(format!("Creditted node {} with {credit} seconds of reported uptime\n", node.id).as_bytes())
+                                            .await
+                                            .unwrap();
+                                    }
                                     node.uptime_info =
                                         Some((current_time as i64, reported_uptime, total_uptime));
                                     continue;
@@ -964,12 +1310,24 @@ async fn main() {
                                 // Account for the fact that we are actually out of the period
                                 let out_of_period = current_time - end_ts as u64;
                                 if out_of_period < reported_uptime {
-                                    total_uptime += u64::min(
+                                    let credit = u64::min(
                                         reported_uptime - out_of_period,
                                         (NODE_UPTIME_REPORT_INTERVAL_SECONDS
                                             + UPTIME_GRACE_PERIOD_SECONDS)
                                             as u64,
                                     );
+                                    total_uptime += credit;
+                                    if (reported_uptime - out_of_period) != credit {
+                                        log_file
+                                        .write_all(format!("Creditted node {} with {credit} seconds of uptime after a reboot, less than the reported {} seconds as the gap is too big\n", node.id, reported_uptime - out_of_period).as_bytes())
+                                        .await
+                                        .unwrap();
+                                    } else {
+                                        log_file
+                                        .write_all(format!("Creditted node {} with {credit} seconds of reported uptime after a reboot\n", node.id).as_bytes())
+                                        .await
+                                        .unwrap();
+                                    }
                                 }
                                 node.uptime_info =
                                     Some((current_time as i64, reported_uptime, total_uptime));
@@ -993,6 +1351,10 @@ async fn main() {
                                         reported_timestamp: ts,
                                         block_reported: height,
                                     };
+                                    log_file
+                                        .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, so time would have advanced slower on the node than in the universe\n", node.id).as_bytes())
+                                        .await
+                                        .unwrap();
                                 }
                                 continue;
                             }
@@ -1005,6 +1367,10 @@ async fn main() {
                                     reported_timestamp: ts,
                                     block_reported: height,
                                 };
+                                log_file
+                                    .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, so time would have advanced faster on the node than in the universe\n", node.id).as_bytes())
+                                    .await
+                                    .unwrap();
                                 continue;
                             }
 
@@ -1041,7 +1407,14 @@ async fn main() {
                 node.violation = Violation::BootRequestExpired {
                     requested: boot_request,
                     booted: None,
-                }
+                };
+                log_file
+                    .write_all(format!("Detected farmer bot boot violation for node {}, request was done at {} but node never booted\n",
+                        node.id,
+                        Utc.timestamp_opt(boot_request, 0).unwrap().to_rfc2822(),
+                    ).as_bytes())
+                    .await
+                    .unwrap();
             }
         }
     }
@@ -1059,6 +1432,10 @@ async fn main() {
             if node.violation.is_none() {
                 node.violation = Violation::MissingTwin;
             }
+            log_file
+                .write_all(format!("Node {} ended period without twin\n", node.id,).as_bytes())
+                .await
+                .unwrap();
             continue;
         };
         let has_relay = match twin.relay {
@@ -1068,11 +1445,27 @@ async fn main() {
         };
         if !has_relay && node.violation.is_none() {
             node.violation = Violation::MissingRelay;
+            log_file
+                .write_all(
+                    format!("Node {} ended period without twin relay set\n", node.id,).as_bytes(),
+                )
+                .await
+                .unwrap();
         }
         if let Some(ref pk) = twin.pk {
             // Secp256k1 public key size is 33 bytes in compressed form
             if pk.len() != 33 && node.violation.is_none() {
                 node.violation = Violation::InvalidPublicKey;
+                log_file
+                    .write_all(
+                        format!(
+                            "Node {} ended period with invalid public key set on twin\n",
+                            node.id,
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
             }
         }
     }
@@ -1778,7 +2171,7 @@ async fn block_import(
     wss_url: &str,
     start: usize,
     end: usize,
-) -> mpsc::Receiver<(i64, Vec<RuntimeEvents>)> {
+) -> mpsc::Receiver<(u32, i64, Vec<RuntimeEvents>)> {
     let mut t_rec = Vec::with_capacity(RPC_THREADS);
     for i in 0..RPC_THREADS {
         let client = DynamicClient::new(&wss_url).await.unwrap();
@@ -1789,7 +2182,7 @@ async fn block_import(
                 let hash = client.hash_at_height(Some(height as u32)).await.unwrap();
                 let evts = client.events(hash).await.unwrap();
                 let ts = client.timestamp(hash).await.unwrap() / 1000;
-                if let Err(e) = tx.send((ts as i64, evts)).await {
+                if let Err(e) = tx.send((height as u32, ts as i64, evts)).await {
                     panic!("{e}");
                 }
                 height += RPC_THREADS;
