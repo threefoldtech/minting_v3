@@ -450,7 +450,7 @@ async fn main() {
                 format!(
                     "Loaded block {} ({}) containing {} events\n",
                     block_height,
-                    Utc.timestamp_opt(end_ts, 0).unwrap().to_rfc2822(),
+                    Utc.timestamp_opt(ts, 0).unwrap().to_rfc2822(),
                     evts.len()
                 )
                 .as_bytes(),
@@ -1124,7 +1124,7 @@ async fn main() {
                 format!(
                     "Loaded block {} ({}) containing {} events\n",
                     block_height,
-                    Utc.timestamp_opt(end_ts, 0).unwrap().to_rfc2822(),
+                    Utc.timestamp_opt(ts, 0).unwrap().to_rfc2822(),
                     evts.len()
                 )
                 .as_bytes(),
