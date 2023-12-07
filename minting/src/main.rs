@@ -308,6 +308,9 @@ async fn main() {
         .await
         .unwrap();
 
+    let start_block_hash = client.hash_at_height(Some(start_block)).await.unwrap();
+    let start_block_ts = client.timestamp(start_block_hash).await.unwrap() / 1000;
+
     // Insert missing entries for power state, and update node power managed if it currently is
     // power managed.
     for (node_id, node) in nodes.iter_mut() {
@@ -323,11 +326,17 @@ async fn main() {
             }
             Some(NodePower {
                 state: PowerState::Down(block),
-                target: _,
+                target,
             }) => {
                 let hash = client.hash_at_height(Some(*block)).await.unwrap();
                 let ts = client.timestamp(hash).await.unwrap() / 1000;
                 node.power_managed = Some(ts as i64);
+                if let Power::Up = target {
+                    // Set the powerup request as start timestamp. Technically this is wrong,
+                    // however this will be validated properly in the previous period in the
+                    // post period checks.
+                    node.power_manage_boot = Some(start_block_ts as i64);
+                }
             }
             _ => {}
         }
@@ -553,60 +562,61 @@ async fn main() {
                             id, height
                         ),
                     };
-                    if let Some(time_set_down) = node.power_managed {
-                        // Ignore the event if it is sent after the node is supposed to go down,
-                        // this will be accounted for once the node starts up again.
-                        // For the node to have been properly power managed, it must be booted
-                        // after it was set to down.
-                        if (current_time - reported_uptime) as i64 > time_set_down {
-                            // node got power managed to down
-                            let time_delta = current_time as i64 - time_set_down;
-                            assert!(time_delta >= 0, "uptime events can't travel back in time");
-                            let mut total_uptime =
-                                if let Some((_, _, total_uptime)) = node.uptime_info {
-                                    total_uptime
-                                } else {
-                                    0
-                                };
-                            // Only add uptime if node came back online in time.
-                            if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
-                                // Check and scale to match the actual period start if needed
-                                if time_set_down < start_ts {
-                                    total_uptime += (current_time as i64 - start_ts) as u64;
-                                    log_file
-                                        .write_all(
-                                            format!(
-                                                "Added {} seconds of uptime for node {}, scaled in period start\n",
-                                                current_time as i64 - start_ts,
-                                                node.id
+
+                    // We are power managed and got a request to wake up.
+                    match (node.power_managed, node.power_manage_boot) {
+                        (Some(time_set_down), Some(boot_request)) => {
+                            // Ignore the event if it is sent after the node is supposed to go down,
+                            // this will be accounted for once the node starts up again.
+                            // For the node to have been properly power managed, it must be booted
+                            // after it was set to down.
+                            if (current_time - reported_uptime) as i64 > time_set_down {
+                                // node got power managed to down
+                                let time_delta = current_time as i64 - time_set_down;
+                                assert!(time_delta >= 0, "uptime events can't travel back in time");
+                                let mut total_uptime =
+                                    if let Some((_, _, total_uptime)) = node.uptime_info {
+                                        total_uptime
+                                    } else {
+                                        0
+                                    };
+                                // Only add uptime if node came back online in time.
+                                if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
+                                    // Check and scale to match the actual period start if needed
+                                    if time_set_down < start_ts {
+                                        total_uptime += (current_time as i64 - start_ts) as u64;
+                                        log_file
+                                            .write_all(
+                                                format!(
+                                                    "Added {} seconds of uptime for node {}, scaled in period start\n",
+                                                    current_time as i64 - start_ts,
+                                                    node.id
+                                                )
+                                                .as_bytes(),
                                             )
-                                            .as_bytes(),
-                                        )
-                                        .await
-                                        .unwrap();
-                                } else {
-                                    total_uptime += time_delta as u64;
-                                    log_file
-                                        .write_all(
-                                            format!(
-                                                "Added {time_delta} seconds of uptime for node {}\n",
-                                                node.id
+                                            .await
+                                            .unwrap();
+                                    } else {
+                                        total_uptime += time_delta as u64;
+                                        log_file
+                                            .write_all(
+                                                format!(
+                                                    "Added {time_delta} seconds of uptime for node {}\n",
+                                                    node.id
+                                                )
+                                                .as_bytes(),
                                             )
-                                            .as_bytes(),
-                                        )
+                                            .await
+                                            .unwrap();
+                                    }
+                                } else {
+                                    log_file
+                                        .write_all(format!("Refusing to credit uptime for power managed node {} as the last boot was {time_delta} seconds ago, more than the allowed 24 hours\n", node.id).as_bytes())
                                         .await
                                         .unwrap();
                                 }
-                            } else {
-                                log_file
-                                .write_all(format!("Refusing to credit uptime for power managed node {} as the last boot was {time_delta} seconds ago, more than the allowed 24 hours\n", node.id).as_bytes())
-                                .await
-                                .unwrap();
-                            }
-                            // Speaking of time, node needs to be booted within the allotted time
-                            // frame.
-                            // Use Option::take here so we always leave a None value.
-                            if let Some(boot_request) = node.power_manage_boot.take() {
+                                // Speaking of time, node needs to be booted within the allotted time
+                                // frame.
                                 if (current_time - reported_uptime) as i64 - boot_request
                                     > MAX_POWER_MANAGER_BOOT_TIME
                                 {
@@ -627,157 +637,204 @@ async fn main() {
                                             .unwrap();
                                     }
                                 }
-                            }
-                            // Clear the fact that we got power managed, if it is still the case, it
-                            // will be set again in the proper event handler.
-                            node.power_managed = None;
-                            node.uptime_info =
-                                Some((current_time as i64, reported_uptime, total_uptime));
-                            // Also mark a boot
-                            node.boot_time = Some((
-                                (current_time - reported_uptime) as i64,
-                                current_time as i64,
-                            ));
-                        } else {
-                            log_file
+                                // Clear the fact that we got power managed, if it is still the case, it
+                                // will be set again in the proper event handler.
+                                node.power_managed = None;
+                                node.power_manage_boot = None;
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, total_uptime));
+                                // Also mark a boot
+                                node.boot_time = Some((
+                                    (current_time - reported_uptime) as i64,
+                                    current_time as i64,
+                                ));
+                            } else {
+                                log_file
                                 .write_all(format!("Ignoring uptime event for node {} as it happened before the node powered down after being requested to do so\n", node.id).as_bytes())
                                 .await
                                 .unwrap();
+                            }
                         }
-                    } else {
-                        if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
-                            node.uptime_info
-                        {
-                            let report_delta = current_time as i64 - last_reported_at;
-                            let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
-                            // There are quite some situations here. Notice that due to the
-                            // blockchain only producing blocks every 6 seconds, and network delay
-                            // + a host of other issues, we will allow a node to report uptime with
-                            // "grace period" of a minute or so in either direction.
-                            //
-                            // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
-                            //    rubish.
-                            if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                                if node.violation.is_none() {
-                                    node.violation = Violation::UptimeTooHigh {
-                                        previous_uptime: last_reported_uptime,
-                                        previous_timestamp: last_reported_at,
-                                        reported_uptime,
-                                        reported_timestamp: ts,
-                                        block_reported: height,
-                                    };
-                                }
-                                node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
+                        // We are power managed but woke up without boot request. We explicitly ignore this: being
+                        // put to sleep by the farmer bot requires a wakeup from the farmer bot. This case also
+                        // means nodes just go to sleep anyhow.
+                        (Some(_), None) => {
+                            log_file
+                                .write_all(
+                                    format!("Ignoring boot for node {} which is power managed, but did not get a boot request from the farmer bot\n", node.id)
+                                        .as_bytes(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        // We got a wakeup request from farmer bot but we are not sleeping due to
+                        // the farmer bot. This should not happen.
+                        (None, Some(_)) => {
+                            log_file
+                                .write_all(
+                                    format!("Ignoring uptime for node {} after farmer bot asked for a boot while the node was not sleeping as a result of farmer bot\n", node.id)
+                                        .as_bytes(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        (None, None) => {
+                            if let Some((
+                                last_reported_at,
+                                last_reported_uptime,
+                                mut total_uptime,
+                            )) = node.uptime_info
+                            {
+                                let report_delta = current_time as i64 - last_reported_at;
+                                let uptime_delta =
+                                    reported_uptime as i64 - last_reported_uptime as i64;
+                                // There are quite some situations here. Notice that due to the
+                                // blockchain only producing blocks every 6 seconds, and network delay
+                                // + a host of other issues, we will allow a node to report uptime with
+                                // "grace period" of a minute or so in either direction.
+                                //
+                                // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
+                                //    rubish.
+                                if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
+                                    if node.violation.is_none() {
+                                        node.violation = Violation::UptimeTooHigh {
+                                            previous_uptime: last_reported_uptime,
+                                            previous_timestamp: last_reported_at,
+                                            reported_uptime,
+                                            reported_timestamp: ts,
+                                            block_reported: height,
+                                        };
+                                    }
+                                    node.uptime_info =
+                                        Some((current_time as i64, reported_uptime, total_uptime));
 
-                                log_file
+                                    log_file
                                     .write_all(format!("Node {} reported an uptime increase of {uptime_delta} seconds, while reports are {report_delta} seconds appart\n",node.id,).as_bytes())
                                     .await
                                     .unwrap();
-                                continue;
-                            }
-                            // 2. The difference in uptime is within reason of the difference in
-                            //    report times, i.e. the node is properly reporting.
-                            if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
-                                && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
-                            {
-                                // check skew
-                                if let Some((boot, detected)) = node.boot_time {
-                                    let new_boot = (current_time - reported_uptime) as i64;
-                                    if (new_boot - boot).abs() >= CLOCK_SKEW_INTERVAL {
-                                        // This is a violation
-                                        if node.violation.is_none() {
-                                            node.violation = Violation::ClockSkew {
-                                                original_boot: boot,
-                                                current_boot: new_boot,
-                                                previous_timestamp: detected,
-                                                reported_timestamp: current_time as i64,
-                                            };
-                                        }
+                                    continue;
+                                }
+                                // 2. The difference in uptime is within reason of the difference in
+                                //    report times, i.e. the node is properly reporting.
+                                if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
+                                    && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+                                {
+                                    // check skew
+                                    if let Some((boot, detected)) = node.boot_time {
+                                        let new_boot = (current_time - reported_uptime) as i64;
+                                        if (new_boot - boot).abs() >= CLOCK_SKEW_INTERVAL {
+                                            // This is a violation
+                                            if node.violation.is_none() {
+                                                node.violation = Violation::ClockSkew {
+                                                    original_boot: boot,
+                                                    current_boot: new_boot,
+                                                    previous_timestamp: detected,
+                                                    reported_timestamp: current_time as i64,
+                                                };
+                                            }
 
-                                        log_file
+                                            log_file
                                             .write_all(format!("Node {} has a detected clock skew of {} seconds, more than the allowed {CLOCK_SKEW_INTERVAL} seconds\n",node.id, (new_boot - boot).abs()).as_bytes())
                                             .await
                                             .unwrap();
+                                        }
+                                    } else {
+                                        panic!("node does not have boot time but does have uptime")
                                     }
-                                } else {
-                                    panic!("node does not have boot time but does have uptime")
-                                }
 
-                                // It is technically possible for the delta to be less than 0 and
-                                // within the expected time frame. If nodes boot, send uptime, then
-                                // immediately reboot that is possible. In those cases, handle that
-                                // below, as that is the reboot detection.
-                                if uptime_delta > 0 {
-                                    // Simply add the uptime delta. If this is too large or low by a
-                                    // couple of seconds it will be corrected by the next pings anyhow.
-                                    // That being said, we also limit the amount of uptime credit
-                                    // to the uptime report interval + grace period, as healthy
-                                    // nodes _must_ ping every interval amount of time
+                                    // It is technically possible for the delta to be less than 0 and
+                                    // within the expected time frame. If nodes boot, send uptime, then
+                                    // immediately reboot that is possible. In those cases, handle that
+                                    // below, as that is the reboot detection.
+                                    if uptime_delta > 0 {
+                                        // Simply add the uptime delta. If this is too large or low by a
+                                        // couple of seconds it will be corrected by the next pings anyhow.
+                                        // That being said, we also limit the amount of uptime credit
+                                        // to the uptime report interval + grace period, as healthy
+                                        // nodes _must_ ping every interval amount of time
+                                        let credit = u64::min(
+                                            uptime_delta as u64,
+                                            (NODE_UPTIME_REPORT_INTERVAL_SECONDS
+                                                + UPTIME_GRACE_PERIOD_SECONDS)
+                                                as u64,
+                                        );
+                                        total_uptime += credit;
+                                        if credit != uptime_delta as u64 {
+                                            log_file
+                                            .write_all(format!("credited node {} with {credit} seconds of uptime, less than the reported {uptime_delta} seconds as the gap is too big\n", node.id).as_bytes())
+                                            .await
+                                            .unwrap();
+                                        } else {
+                                            log_file
+                                            .write_all(format!("credited node {} with {credit} seconds of reported uptime\n", node.id).as_bytes())
+                                            .await
+                                            .unwrap();
+                                        }
+                                        node.uptime_info = Some((
+                                            current_time as i64,
+                                            reported_uptime,
+                                            total_uptime,
+                                        ));
+                                        continue;
+                                    }
+                                }
+                                // 3. The difference in uptime is too low. Again there are multiple
+                                //    scenarios. Either way we consider the node rebooted. Depending on
+                                //    the reported uptime, the node reports legit uptime, or it reports
+                                //    an uptime which is too high.
+                                //
+                                //    1. Uptime is within bounds.
+                                if reported_uptime as i64 <= report_delta {
                                     let credit = u64::min(
-                                        uptime_delta as u64,
+                                        reported_uptime,
                                         (NODE_UPTIME_REPORT_INTERVAL_SECONDS
                                             + UPTIME_GRACE_PERIOD_SECONDS)
                                             as u64,
                                     );
                                     total_uptime += credit;
-                                    if credit != uptime_delta as u64 {
+                                    if reported_uptime != credit {
                                         log_file
-                                            .write_all(format!("credited node {} with {credit} seconds of uptime, less than the reported {uptime_delta} seconds as the gap is too big\n", node.id).as_bytes())
-                                            .await
-                                            .unwrap();
-                                    } else {
-                                        log_file
-                                            .write_all(format!("credited node {} with {credit} seconds of reported uptime\n", node.id).as_bytes())
-                                            .await
-                                            .unwrap();
-                                    }
-                                    node.uptime_info =
-                                        Some((current_time as i64, reported_uptime, total_uptime));
-                                    continue;
-                                }
-                            }
-                            // 3. The difference in uptime is too low. Again there are multiple
-                            //    scenarios. Either way we consider the node rebooted. Depending on
-                            //    the reported uptime, the node reports legit uptime, or it reports
-                            //    an uptime which is too high.
-                            //
-                            //    1. Uptime is within bounds.
-                            if reported_uptime as i64 <= report_delta {
-                                let credit = u64::min(
-                                    reported_uptime,
-                                    (NODE_UPTIME_REPORT_INTERVAL_SECONDS
-                                        + UPTIME_GRACE_PERIOD_SECONDS)
-                                        as u64,
-                                );
-                                total_uptime += credit;
-                                if reported_uptime != credit {
-                                    log_file
                                         .write_all(format!("credited node {} with {credit} seconds of uptime after a reboot, less than the reported {uptime_delta} seconds as the gap is too big\n", node.id).as_bytes())
                                         .await
                                         .unwrap();
-                                } else {
-                                    log_file
+                                    } else {
+                                        log_file
                                         .write_all(format!("credited node {} with {credit} seconds of reported uptime after a reboot\n", node.id).as_bytes())
                                         .await
                                         .unwrap();
+                                    }
+                                    node.uptime_info =
+                                        Some((current_time as i64, reported_uptime, total_uptime));
+                                    node.boot_time = Some((
+                                        (current_time - reported_uptime) as i64,
+                                        current_time as i64,
+                                    ));
+                                    continue;
                                 }
-                                node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
-                                node.boot_time = Some((
-                                    (current_time - reported_uptime) as i64,
-                                    current_time as i64,
-                                ));
-                                continue;
-                            }
-                            //    2. Uptime is actually higher than difference in timestamp, but
-                            //       not high enough to be valid. This means the node was
-                            //       supposedly rebooted _before_ the previous uptime report,
-                            //       meaning either that report is invalid or this report is
-                            //       invalid.
-                            if reported_uptime > last_reported_uptime {
+                                //    2. Uptime is actually higher than difference in timestamp, but
+                                //       not high enough to be valid. This means the node was
+                                //       supposedly rebooted _before_ the previous uptime report,
+                                //       meaning either that report is invalid or this report is
+                                //       invalid.
+                                if reported_uptime > last_reported_uptime {
+                                    if node.violation.is_none() {
+                                        node.violation = Violation::UptimeTooLow {
+                                            previous_uptime: last_reported_uptime,
+                                            previous_timestamp: last_reported_at,
+                                            reported_uptime,
+                                            reported_timestamp: ts,
+                                            block_reported: height,
+                                        };
+                                        log_file
+                                        .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, so time would have advanced slower on the node than in the universe\n", node.id).as_bytes())
+                                        .await
+                                        .unwrap();
+                                    }
+                                    continue;
+                                }
+                                //    3. Uptime is too high, this is garbage
                                 if node.violation.is_none() {
-                                    node.violation = Violation::UptimeTooLow {
+                                    node.violation = Violation::InvalidReboot {
                                         previous_uptime: last_reported_uptime,
                                         previous_timestamp: last_reported_at,
                                         reported_uptime,
@@ -785,50 +842,36 @@ async fn main() {
                                         block_reported: height,
                                     };
                                     log_file
-                                        .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, so time would have advanced slower on the node than in the universe\n", node.id).as_bytes())
-                                        .await
-                                        .unwrap();
-                                }
-                                continue;
-                            }
-                            //    3. Uptime is too high, this is garbage
-                            if node.violation.is_none() {
-                                node.violation = Violation::InvalidReboot {
-                                    previous_uptime: last_reported_uptime,
-                                    previous_timestamp: last_reported_at,
-                                    reported_uptime,
-                                    reported_timestamp: ts,
-                                    block_reported: height,
-                                };
-                                log_file
                                     .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, so time would have advanced faster on the node than in the universe\n", node.id).as_bytes())
                                     .await
                                     .unwrap();
-                            }
-                            continue;
-                        } else {
-                            let period_duration = current_time as i64 - start_ts;
-                            // Make sure we don't give more credit than the current length of the
-                            // period.
-                            // Account for uptime period
-                            let up_in_period = u64::min(
-                                std::cmp::min(period_duration as u64, reported_uptime),
-                                (NODE_UPTIME_REPORT_INTERVAL_SECONDS + UPTIME_GRACE_PERIOD_SECONDS)
-                                    as u64,
-                            );
-                            log_file
+                                }
+                                continue;
+                            } else {
+                                let period_duration = current_time as i64 - start_ts;
+                                // Make sure we don't give more credit than the current length of the
+                                // period.
+                                // Account for uptime period
+                                let up_in_period = u64::min(
+                                    std::cmp::min(period_duration as u64, reported_uptime),
+                                    (NODE_UPTIME_REPORT_INTERVAL_SECONDS
+                                        + UPTIME_GRACE_PERIOD_SECONDS)
+                                        as u64,
+                                );
+                                log_file
                                 .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, scaled to {up_in_period} seconds\n", node.id).as_bytes())
                                 .await
                                 .unwrap();
-                            // Save uptime info
-                            node.uptime_info =
-                                Some((current_time as i64, reported_uptime, up_in_period));
-                            node.boot_time = Some((
-                                (current_time - reported_uptime) as i64,
-                                current_time as i64,
-                            ));
+                                // Save uptime info
+                                node.uptime_info =
+                                    Some((current_time as i64, reported_uptime, up_in_period));
+                                node.boot_time = Some((
+                                    (current_time - reported_uptime) as i64,
+                                    current_time as i64,
+                                ));
+                            }
                         }
-                    }
+                    };
                 }
                 RuntimeEvents::ContractUsedResourcesUpdated(data) => {
                     let contract = match contracts.get_mut(&data.contract_id) {
@@ -1117,7 +1160,7 @@ async fn main() {
             if let Some((block_height, ts, evts)) = import_queue.recv().await {
                 (block_height, ts, evts)
             } else {
-                panic!("Block import exitted too early");
+                panic!("Block import exited too early");
             };
         log_file
             .write_all(
@@ -1141,30 +1184,34 @@ async fn main() {
                         None => continue,
                     };
 
-                    if let Some(time_set_down) = node.power_managed {
-                        // node got power managed to down
-                        let time_delta = current_time as i64 - time_set_down;
-                        assert!(time_delta >= 0, "uptime events can't travel back in time");
-                        let mut total_uptime = if let Some((last_reported_at, _, total_uptime)) =
-                            node.uptime_info
-                        {
-                            assert!(
+                    match (node.power_managed, node.power_manage_boot) {
+                        (Some(time_set_down), Some(boot_request)) => {
+                            // node got power managed to down
+                            let time_delta = current_time as i64 - time_set_down;
+                            assert!(time_delta >= 0, "uptime events can't travel back in time");
+                            let mut total_uptime = if let Some((
+                                last_reported_at,
+                                _,
+                                total_uptime,
+                            )) = node.uptime_info
+                            {
+                                assert!(
                                     last_reported_at < end_ts,
                                     "there can only be 1 uptime event post period for a power managed node"
                                 );
-                            total_uptime
-                        } else {
-                            0
-                        };
-                        // Only add uptime if node came back online in time.
-                        if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
-                            let uptime_diff = end_ts - i64::max(start_ts, time_set_down);
-                            assert!(
-                                uptime_diff >= 0,
-                                "uptime event must be sent after node wen't down, chronology"
-                            );
-                            total_uptime += uptime_diff as u64;
-                            log_file
+                                total_uptime
+                            } else {
+                                0
+                            };
+                            // Only add uptime if node came back online in time.
+                            if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
+                                let uptime_diff = end_ts - i64::max(start_ts, time_set_down);
+                                assert!(
+                                    uptime_diff >= 0,
+                                    "uptime event must be sent after node wen't down, chronology"
+                                );
+                                total_uptime += uptime_diff as u64;
+                                log_file
                                 .write_all(
                                     format!(
                                         "Added {uptime_diff} seconds of uptime for node {}, for farmer bot boot post period\n",
@@ -1174,12 +1221,10 @@ async fn main() {
                                 )
                                 .await
                                 .unwrap();
-                        }
+                            }
 
-                        // Speaking of time, node needs to be booted within the allotted time
-                        // frame.
-                        // Use Option::take here so we always leave a None value.
-                        if let Some(boot_request) = node.power_manage_boot.take() {
+                            // Speaking of time, node needs to be booted within the allotted time
+                            // frame.
                             if (current_time - reported_uptime) as i64 - boot_request
                                 > MAX_POWER_MANAGER_BOOT_TIME
                             {
@@ -1199,158 +1244,207 @@ async fn main() {
                                         .unwrap();
                                 }
                             }
+                            // Clear the fact that we got power managed, if it is still the case, it
+                            // will be set again in the proper event handler.
+                            node.power_managed = None;
+                            node.power_manage_boot = None;
+                            node.uptime_info =
+                                Some((current_time as i64, reported_uptime, total_uptime));
+                            // Also mark a boot
+                            node.boot_time = Some((
+                                (current_time - reported_uptime) as i64,
+                                current_time as i64,
+                            ));
                         }
-                        // Clear the fact that we got power managed, if it is still the case, it
-                        // will be set again in the proper event handler.
-                        node.power_managed = None;
-                        node.uptime_info =
-                            Some((current_time as i64, reported_uptime, total_uptime));
-                        // Also mark a boot
-                        node.boot_time =
-                            Some(((current_time - reported_uptime) as i64, current_time as i64));
-                    } else {
-                        if let Some((last_reported_at, last_reported_uptime, mut total_uptime)) =
-                            node.uptime_info
-                        {
-                            // only collect 1 uptime event after the period ended
-                            if last_reported_at >= end_ts {
-                                continue;
-                            }
-                            let report_delta = current_time as i64 - last_reported_at;
-                            let uptime_delta = reported_uptime as i64 - last_reported_uptime as i64;
-                            let delta_in_period = end_ts - last_reported_at;
-                            // There are quite some situations here. Notice that due to the
-                            // blockchain only producing blocks every 6 seconds, and network delay
-                            // + a host of other issues, we will allow a node to report uptime with
-                            // "grace period" of a minute or so in either direction.
-                            //
-                            // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
-                            //    rubish.
-                            if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
-                                // We need to register the violation here as we won't be able to
-                                // next period (since we don't scrape points from before the period
-                                // atm).
-                                if node.violation.is_none() {
-                                    node.violation = Violation::UptimeTooHigh {
-                                        previous_uptime: last_reported_uptime,
-                                        previous_timestamp: last_reported_at,
-                                        reported_uptime,
-                                        reported_timestamp: ts,
-                                        block_reported: height,
-                                    };
-                                }
-                                node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
-                                log_file
-                                    .write_all(format!("Node {} reported an uptime increase of {uptime_delta} seconds, while reports are {report_delta} seconds appart\n",node.id,).as_bytes())
-                                    .await
-                                    .unwrap();
-                                continue;
-                            }
-                            // 2. The difference in uptime is within reason of the difference in
-                            //    report times, i.e. the node is properly reporting.
-                            if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
-                                && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+                        // We are power managed but woke up without boot request. We explicitly ignore this: being
+                        // put to sleep by the farmer bot requires a wakeup from the farmer bot. This case also
+                        // means nodes just go to sleep anyhow.
+                        (Some(_), None) => {
+                            log_file
+                                .write_all(
+                                    format!("Ignoring boot for node {} which is power managed, but did not get a boot request from the farmer bot in the period\n", node.id)
+                                        .as_bytes(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        // We got a wakeup request from farmer bot but we are not sleeping due to
+                        // the farmer bot. This should not happen.
+                        (None, Some(_)) => {
+                            log_file
+                                .write_all(
+                                    format!("Ignoring uptime for node {} after farmer bot asked for a boot while the node was not sleeping as a result of farmer bot\n", node.id)
+                                        .as_bytes(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        (None, None) => {
+                            if let Some((
+                                last_reported_at,
+                                last_reported_uptime,
+                                mut total_uptime,
+                            )) = node.uptime_info
                             {
-                                // check skew
-                                if let Some((boot, detected)) = node.boot_time {
-                                    let new_boot = (current_time - reported_uptime) as i64;
-                                    if (new_boot - boot).abs() >= CLOCK_SKEW_INTERVAL {
-                                        // This is a violation
-                                        if node.violation.is_none() {
-                                            node.violation = Violation::ClockSkew {
-                                                original_boot: boot,
-                                                current_boot: new_boot,
-                                                previous_timestamp: detected,
-                                                reported_timestamp: current_time as i64,
-                                            };
-                                        }
-                                        log_file
-                                            .write_all(format!("Node {} has a detected clock skew of {} seconds, more than the allowed {CLOCK_SKEW_INTERVAL} seconds\n",node.id, (new_boot - boot).abs()).as_bytes())
-                                            .await
-                                            .unwrap();
-                                    }
-                                } else {
-                                    panic!("node does not have boot time but does have uptime")
+                                // only collect 1 uptime event after the period ended
+                                if last_reported_at >= end_ts {
+                                    continue;
                                 }
-
-                                // It is technically possible for the delta to be less than 0 and
-                                // within the expected time frame. If nodes boot, send uptime, then
-                                // immediately reboot that is possible. In those cases, handle that
-                                // below, as that is the reboot detection.
-                                if uptime_delta > 0 {
-                                    // Simply add the uptime delta. If this is too large or low by a
-                                    // couple of seconds it will be corrected by the next pings anyhow.
-                                    //
-                                    // Make sure we don't add too much based on the period.
-                                    let credit = u64::min(
-                                        delta_in_period as u64,
-                                        (NODE_UPTIME_REPORT_INTERVAL_SECONDS
-                                            + UPTIME_GRACE_PERIOD_SECONDS)
-                                            as u64,
-                                    );
-                                    total_uptime += credit;
-                                    if credit != delta_in_period as u64 {
-                                        log_file
-                                            .write_all(format!("credited node {} with {credit} seconds of uptime, less than the reported {delta_in_period} seconds as the gap is too big\n", node.id).as_bytes())
-                                            .await
-                                            .unwrap();
-                                    } else {
-                                        log_file
-                                            .write_all(format!("credited node {} with {credit} seconds of reported uptime\n", node.id).as_bytes())
-                                            .await
-                                            .unwrap();
+                                let report_delta = current_time as i64 - last_reported_at;
+                                let uptime_delta =
+                                    reported_uptime as i64 - last_reported_uptime as i64;
+                                let delta_in_period = end_ts - last_reported_at;
+                                // There are quite some situations here. Notice that due to the
+                                // blockchain only producing blocks every 6 seconds, and network delay
+                                // + a host of other issues, we will allow a node to report uptime with
+                                // "grace period" of a minute or so in either direction.
+                                //
+                                // 1. uptime_delta > report_delta + GRACE_PERIOD. Node is talking
+                                //    rubish.
+                                if uptime_delta > report_delta + UPTIME_GRACE_PERIOD_SECONDS {
+                                    // We need to register the violation here as we won't be able to
+                                    // next period (since we don't scrape points from before the period
+                                    // atm).
+                                    if node.violation.is_none() {
+                                        node.violation = Violation::UptimeTooHigh {
+                                            previous_uptime: last_reported_uptime,
+                                            previous_timestamp: last_reported_at,
+                                            reported_uptime,
+                                            reported_timestamp: ts,
+                                            block_reported: height,
+                                        };
                                     }
                                     node.uptime_info =
                                         Some((current_time as i64, reported_uptime, total_uptime));
+                                    log_file
+                                    .write_all(format!("Node {} reported an uptime increase of {uptime_delta} seconds, while reports are {report_delta} seconds appart\n",node.id,).as_bytes())
+                                    .await
+                                    .unwrap();
                                     continue;
                                 }
-                            }
-                            // 3. The difference in uptime is too low. Again there are multiple
-                            //    scenarios. Either way we consider the node rebooted. Depending on
-                            //    the reported uptime, the node reports legit uptime, or it reports
-                            //    an uptime which is too high.
-                            //
-                            //    1. Uptime is within bounds.
-                            if reported_uptime as i64 <= report_delta {
-                                // Account for the fact that we are actually out of the period
-                                let out_of_period = current_time - end_ts as u64;
-                                if out_of_period < reported_uptime {
-                                    let credit = u64::min(
-                                        reported_uptime - out_of_period,
-                                        (NODE_UPTIME_REPORT_INTERVAL_SECONDS
-                                            + UPTIME_GRACE_PERIOD_SECONDS)
-                                            as u64,
-                                    );
-                                    total_uptime += credit;
-                                    if (reported_uptime - out_of_period) != credit {
-                                        log_file
+                                // 2. The difference in uptime is within reason of the difference in
+                                //    report times, i.e. the node is properly reporting.
+                                if uptime_delta <= report_delta + UPTIME_GRACE_PERIOD_SECONDS
+                                    && uptime_delta >= report_delta - UPTIME_GRACE_PERIOD_SECONDS
+                                {
+                                    // check skew
+                                    if let Some((boot, detected)) = node.boot_time {
+                                        let new_boot = (current_time - reported_uptime) as i64;
+                                        if (new_boot - boot).abs() >= CLOCK_SKEW_INTERVAL {
+                                            // This is a violation
+                                            if node.violation.is_none() {
+                                                node.violation = Violation::ClockSkew {
+                                                    original_boot: boot,
+                                                    current_boot: new_boot,
+                                                    previous_timestamp: detected,
+                                                    reported_timestamp: current_time as i64,
+                                                };
+                                            }
+                                            log_file
+                                            .write_all(format!("Node {} has a detected clock skew of {} seconds, more than the allowed {CLOCK_SKEW_INTERVAL} seconds\n",node.id, (new_boot - boot).abs()).as_bytes())
+                                            .await
+                                            .unwrap();
+                                        }
+                                    } else {
+                                        panic!("node does not have boot time but does have uptime")
+                                    }
+
+                                    // It is technically possible for the delta to be less than 0 and
+                                    // within the expected time frame. If nodes boot, send uptime, then
+                                    // immediately reboot that is possible. In those cases, handle that
+                                    // below, as that is the reboot detection.
+                                    if uptime_delta > 0 {
+                                        // Simply add the uptime delta. If this is too large or low by a
+                                        // couple of seconds it will be corrected by the next pings anyhow.
+                                        //
+                                        // Make sure we don't add too much based on the period.
+                                        let credit = u64::min(
+                                            delta_in_period as u64,
+                                            (NODE_UPTIME_REPORT_INTERVAL_SECONDS
+                                                + UPTIME_GRACE_PERIOD_SECONDS)
+                                                as u64,
+                                        );
+                                        total_uptime += credit;
+                                        if credit != delta_in_period as u64 {
+                                            log_file
+                                            .write_all(format!("credited node {} with {credit} seconds of uptime, less than the reported {delta_in_period} seconds as the gap is too big\n", node.id).as_bytes())
+                                            .await
+                                            .unwrap();
+                                        } else {
+                                            log_file
+                                            .write_all(format!("credited node {} with {credit} seconds of reported uptime\n", node.id).as_bytes())
+                                            .await
+                                            .unwrap();
+                                        }
+                                        node.uptime_info = Some((
+                                            current_time as i64,
+                                            reported_uptime,
+                                            total_uptime,
+                                        ));
+                                        continue;
+                                    }
+                                }
+                                // 3. The difference in uptime is too low. Again there are multiple
+                                //    scenarios. Either way we consider the node rebooted. Depending on
+                                //    the reported uptime, the node reports legit uptime, or it reports
+                                //    an uptime which is too high.
+                                //
+                                //    1. Uptime is within bounds.
+                                if reported_uptime as i64 <= report_delta {
+                                    // Account for the fact that we are actually out of the period
+                                    let out_of_period = current_time - end_ts as u64;
+                                    if out_of_period < reported_uptime {
+                                        let credit = u64::min(
+                                            reported_uptime - out_of_period,
+                                            (NODE_UPTIME_REPORT_INTERVAL_SECONDS
+                                                + UPTIME_GRACE_PERIOD_SECONDS)
+                                                as u64,
+                                        );
+                                        total_uptime += credit;
+                                        if (reported_uptime - out_of_period) != credit {
+                                            log_file
                                         .write_all(format!("credited node {} with {credit} seconds of uptime after a reboot, less than the reported {} seconds as the gap is too big\n", node.id, reported_uptime - out_of_period).as_bytes())
                                         .await
                                         .unwrap();
-                                    } else {
-                                        log_file
+                                        } else {
+                                            log_file
                                         .write_all(format!("credited node {} with {credit} seconds of reported uptime after a reboot\n", node.id).as_bytes())
                                         .await
                                         .unwrap();
+                                        }
                                     }
+                                    node.uptime_info =
+                                        Some((current_time as i64, reported_uptime, total_uptime));
+                                    node.boot_time = Some((
+                                        (current_time - reported_uptime) as i64,
+                                        current_time as i64,
+                                    ));
+                                    continue;
                                 }
-                                node.uptime_info =
-                                    Some((current_time as i64, reported_uptime, total_uptime));
-                                node.boot_time = Some((
-                                    (current_time - reported_uptime) as i64,
-                                    current_time as i64,
-                                ));
-                                continue;
-                            }
-                            //    2. Uptime is actually higher than difference in timestamp, but
-                            //       not high enough to be valid. This means the node was
-                            //       supposedly rebooted _before_ the previous uptime report,
-                            //       meaning either that report is invalid or this report is
-                            //       invalid.
-                            if reported_uptime > last_reported_uptime {
+                                //    2. Uptime is actually higher than difference in timestamp, but
+                                //       not high enough to be valid. This means the node was
+                                //       supposedly rebooted _before_ the previous uptime report,
+                                //       meaning either that report is invalid or this report is
+                                //       invalid.
+                                if reported_uptime > last_reported_uptime {
+                                    if node.violation.is_none() {
+                                        node.violation = Violation::UptimeTooLow {
+                                            previous_uptime: last_reported_uptime,
+                                            previous_timestamp: last_reported_at,
+                                            reported_uptime,
+                                            reported_timestamp: ts,
+                                            block_reported: height,
+                                        };
+                                        log_file
+                                        .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, so time would have advanced slower on the node than in the universe\n", node.id).as_bytes())
+                                        .await
+                                        .unwrap();
+                                    }
+                                    continue;
+                                }
+                                //    3. Uptime is too high, this is garbage
                                 if node.violation.is_none() {
-                                    node.violation = Violation::UptimeTooLow {
+                                    node.violation = Violation::InvalidReboot {
                                         previous_uptime: last_reported_uptime,
                                         previous_timestamp: last_reported_at,
                                         reported_uptime,
@@ -1358,30 +1452,15 @@ async fn main() {
                                         block_reported: height,
                                     };
                                     log_file
-                                        .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, so time would have advanced slower on the node than in the universe\n", node.id).as_bytes())
-                                        .await
-                                        .unwrap();
-                                }
-                                continue;
-                            }
-                            //    3. Uptime is too high, this is garbage
-                            if node.violation.is_none() {
-                                node.violation = Violation::InvalidReboot {
-                                    previous_uptime: last_reported_uptime,
-                                    previous_timestamp: last_reported_at,
-                                    reported_uptime,
-                                    reported_timestamp: ts,
-                                    block_reported: height,
-                                };
-                                log_file
                                     .write_all(format!("Node {} reported uptime of {reported_uptime} seconds, so time would have advanced faster on the node than in the universe\n", node.id).as_bytes())
                                     .await
                                     .unwrap();
-                                continue;
-                            }
+                                    continue;
+                                }
 
-                            // We should have handled all cases. Make this explicit here.
-                            unreachable!();
+                                // We should have handled all cases. Make this explicit here.
+                                unreachable!();
+                            }
                         }
                     }
                 }
