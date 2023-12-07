@@ -1488,6 +1488,17 @@ async fn main() {
     // So if any node has an outstanding power on request here, stick them with a violation.
     for (_, node) in nodes.iter_mut() {
         if let Some(boot_request) = node.power_manage_boot {
+            // Ignore if this is the same as start, no need to slap a violation on what is likely a
+            // dead node.
+            if boot_request == start_block_ts as i64 {
+                log_file
+                    .write_all(format!("Not giving node {} a slow boot violation since it never tried to boot in the first place\n",
+                        node.id,
+                    ).as_bytes())
+                    .await
+                    .unwrap();
+                continue;
+            }
             if node.violation.is_none() {
                 node.violation = Violation::BootRequestExpired {
                     requested: boot_request,
