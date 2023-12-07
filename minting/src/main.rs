@@ -723,12 +723,12 @@ async fn main() {
                                     total_uptime += credit;
                                     if credit != uptime_delta as u64 {
                                         log_file
-                                            .write_all(format!("Creditted node {} with {credit} seconds of uptime, less than the reported {uptime_delta} seconds as the gap is too big\n", node.id).as_bytes())
+                                            .write_all(format!("credited node {} with {credit} seconds of uptime, less than the reported {uptime_delta} seconds as the gap is too big\n", node.id).as_bytes())
                                             .await
                                             .unwrap();
                                     } else {
                                         log_file
-                                            .write_all(format!("Creditted node {} with {credit} seconds of reported uptime\n", node.id).as_bytes())
+                                            .write_all(format!("credited node {} with {credit} seconds of reported uptime\n", node.id).as_bytes())
                                             .await
                                             .unwrap();
                                     }
@@ -753,12 +753,12 @@ async fn main() {
                                 total_uptime += credit;
                                 if reported_uptime != credit {
                                     log_file
-                                        .write_all(format!("Creditted node {} with {credit} seconds of uptime after a reboot, less than the reported {uptime_delta} seconds as the gap is too big\n", node.id).as_bytes())
+                                        .write_all(format!("credited node {} with {credit} seconds of uptime after a reboot, less than the reported {uptime_delta} seconds as the gap is too big\n", node.id).as_bytes())
                                         .await
                                         .unwrap();
                                 } else {
                                     log_file
-                                        .write_all(format!("Creditted node {} with {credit} seconds of reported uptime after a reboot\n", node.id).as_bytes())
+                                        .write_all(format!("credited node {} with {credit} seconds of reported uptime after a reboot\n", node.id).as_bytes())
                                         .await
                                         .unwrap();
                                 }
@@ -1292,12 +1292,12 @@ async fn main() {
                                     total_uptime += credit;
                                     if credit != delta_in_period as u64 {
                                         log_file
-                                            .write_all(format!("Creditted node {} with {credit} seconds of uptime, less than the reported {delta_in_period} seconds as the gap is too big\n", node.id).as_bytes())
+                                            .write_all(format!("credited node {} with {credit} seconds of uptime, less than the reported {delta_in_period} seconds as the gap is too big\n", node.id).as_bytes())
                                             .await
                                             .unwrap();
                                     } else {
                                         log_file
-                                            .write_all(format!("Creditted node {} with {credit} seconds of reported uptime\n", node.id).as_bytes())
+                                            .write_all(format!("credited node {} with {credit} seconds of reported uptime\n", node.id).as_bytes())
                                             .await
                                             .unwrap();
                                     }
@@ -1325,12 +1325,12 @@ async fn main() {
                                     total_uptime += credit;
                                     if (reported_uptime - out_of_period) != credit {
                                         log_file
-                                        .write_all(format!("Creditted node {} with {credit} seconds of uptime after a reboot, less than the reported {} seconds as the gap is too big\n", node.id, reported_uptime - out_of_period).as_bytes())
+                                        .write_all(format!("credited node {} with {credit} seconds of uptime after a reboot, less than the reported {} seconds as the gap is too big\n", node.id, reported_uptime - out_of_period).as_bytes())
                                         .await
                                         .unwrap();
                                     } else {
                                         log_file
-                                        .write_all(format!("Creditted node {} with {credit} seconds of reported uptime after a reboot\n", node.id).as_bytes())
+                                        .write_all(format!("credited node {} with {credit} seconds of reported uptime after a reboot\n", node.id).as_bytes())
                                         .await
                                         .unwrap();
                                     }
