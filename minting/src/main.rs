@@ -794,7 +794,7 @@ async fn main() {
                                     total_uptime += credit;
                                     if reported_uptime != credit {
                                         log_file
-                                        .write_all(format!("credited node {} with {credit} seconds of uptime after a reboot, less than the reported {uptime_delta} seconds as the gap is too big\n", node.id).as_bytes())
+                                        .write_all(format!("credited node {} with {credit} seconds of uptime after a reboot, less than the reported {reported_uptime} seconds as the gap is too big\n", node.id).as_bytes())
                                         .await
                                         .unwrap();
                                     } else {
