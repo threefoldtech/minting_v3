@@ -74,13 +74,13 @@ async fn main() {
     let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
 
-    if period_offset != 60 {
-        panic!("This code is specifically to correct period 60");
+    if period_offset != 61 {
+        panic!("This code is specifically to correct period 61");
     }
 
     // Load existing receipts
-    let existing_receipt_dir = path::PathBuf::from("receipts/60");
-    println!("Loading existing receipts from period 60");
+    let existing_receipt_dir = path::PathBuf::from("receipts/61");
+    println!("Loading existing receipts from period 61");
 
     let mut existing_receipts = HashMap::new();
 
@@ -925,7 +925,7 @@ async fn main() {
     let mut fixup_receipt_dir = path::PathBuf::new();
     fixup_receipt_dir.push("receipts");
     fixup_receipt_dir.push("fixed");
-    fixup_receipt_dir.push("60");
+    fixup_receipt_dir.push("61");
     std::fs::create_dir_all(&fixup_receipt_dir).unwrap();
     for (hash, receipt) in fixup_receipts {
         let mut path = fixup_receipt_dir.clone();
