@@ -117,8 +117,8 @@ async fn main() {
     let mut log_file = tokio::fs::File::create("minting_log.txt").await.unwrap();
 
     let period_offset = args.next().unwrap().parse().unwrap();
-    if period_offset != 67 {
-        panic!("This binary can only be used for period 67");
+    if period_offset != 71 {
+        panic!("This binary can only be used for period 71");
     }
 
     let period = Period::at_offset(period_offset);
