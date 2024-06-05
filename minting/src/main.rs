@@ -1948,13 +1948,7 @@ impl MintingNode {
     }
 
     /// Get the real period for the node given an observed period.
-    ///
-    /// If the node only came online in the observed period, then a period which starts at the
-    /// moment of connection will be returned.
-    fn real_period(&self, mut observed_period: Period) -> Period {
-        if let NodeConnected::Current(ts) = self.connected {
-            observed_period.scale_start(ts);
-        };
+    fn real_period(&self, observed_period: Period) -> Period {
         observed_period
     }
 
@@ -2086,6 +2080,16 @@ impl MintingNode {
                         false
                     })
             {
+                // Enforce minimal uptimes now. For now validate this manually
+                // 95% for DIY
+                // 98% for Certified
+                if (matches!(self.certification_type, NodeCertification::Diy)
+                    && uptime_percentage < 950)
+                    || (matches!(self.certification_type, NodeCertification::Certified)
+                        && uptime_percentage < 980)
+                {
+                    return (0, 0);
+                }
                 (
                     self.node_payout_musd(farming_policies) * uptime_percentage / 1_000,
                     self.node_payout_tft_units(farming_policies) * uptime_percentage / 1_000,
