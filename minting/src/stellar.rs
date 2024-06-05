@@ -53,7 +53,7 @@ impl Horizon {
                 break;
             }
             // TODO: rework so this clone can go
-            cursor = resp.records[resp.records.len() - 1].paging_token.clone();
+            cursor.clone_from(&resp.records[resp.records.len() - 1].paging_token);
         }
     }
 }

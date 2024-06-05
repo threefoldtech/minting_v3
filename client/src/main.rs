@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     println!("node after upgrade found: {:?}", node);
     // }
 
-    let bl = dyn_cl.hash_at_height(Some(5710579 as u32)).await?;
+    let bl = dyn_cl.hash_at_height(Some(5710579_u32)).await?;
     let events = dyn_cl.events(bl).await?;
     for e in events.iter() {
         println!("events: {:?}", e);

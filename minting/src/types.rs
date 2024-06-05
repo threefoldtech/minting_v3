@@ -1,11 +1,7 @@
 use chrono::prelude::*;
 use serde::{Deserialize, Serialize};
-pub use sp_application_crypto::ed25519;
 pub use sp_core::crypto::AccountId32;
-pub use sp_core::H256 as Hash;
 use std::fmt::{self, Display};
-// pub use substrate_api_client::{AccountData, AccountInfo};
-// pub use support::traits::BalanceStatus;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub enum NodeCertification {
@@ -13,6 +9,7 @@ pub enum NodeCertification {
     Certified,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for NodeCertification {
     fn default() -> Self {
         NodeCertification::Diy
@@ -52,6 +49,7 @@ pub enum Unit {
     Terrabytes,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for Unit {
     fn default() -> Unit {
         Unit::Gigabytes
@@ -142,6 +140,7 @@ pub enum FarmCertification {
     Gold,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for FarmCertification {
     fn default() -> Self {
         FarmCertification::NotCertified
@@ -220,6 +219,7 @@ pub enum DiscountLevel {
     Gold,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for DiscountLevel {
     fn default() -> DiscountLevel {
         DiscountLevel::None
@@ -276,6 +276,7 @@ pub struct RentContract {
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::enum_variant_names)]
 pub enum ContractData {
     NodeContract(NodeContract),
     NameContract(NameContract),
@@ -316,6 +317,7 @@ pub enum CertificationCodeType {
     Entity,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for CertificationCodeType {
     fn default() -> Self {
         CertificationCodeType::Farm
@@ -360,6 +362,7 @@ pub struct StellarSignature {
     pub stellar_pub_key: Vec<u8>,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for ContractState {
     fn default() -> ContractState {
         ContractState::Created

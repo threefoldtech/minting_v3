@@ -94,7 +94,7 @@ impl From<RuntimeEntityProof> for EntityProof {
         EntityProof {
             entity_id,
             // SAFETY: signatures are always 64 bytes in the current allowed signature schemes.
-            signature: signature.try_into().unwrap(),
+            signature,
         }
     }
 }

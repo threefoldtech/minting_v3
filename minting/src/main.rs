@@ -217,7 +217,7 @@ async fn main() {
         .await
         .unwrap();
 
-    if previous_receipts.len() > 0 || previous_fixup_receipts.len() > 0 {
+    if !previous_receipts.is_empty() || !previous_fixup_receipts.is_empty() {
         println!(
             "Filtering receipts, pre filter length {}",
             previous_receipts.len() + previous_fixup_receipts.len()
@@ -314,7 +314,7 @@ async fn main() {
     // Insert missing entries for power state, and update node power managed if it currently is
     // power managed.
     for (node_id, node) in nodes.iter_mut() {
-        match power_states.get(&node_id) {
+        match power_states.get(node_id) {
             None => {
                 power_states.insert(
                     *node_id,
@@ -421,7 +421,7 @@ async fn main() {
         .await
         .unwrap()
         .into_iter()
-        .filter_map(|policy| Some((policy.id, policy)))
+        .map(|policy| (policy.id, policy))
         .collect();
     println!("Found {} farming policies", farming_policies.len());
 
@@ -485,7 +485,7 @@ async fn main() {
                             uptime_info: None,
                             boot_time: None,
                             violation: Violation::None,
-                            connected: NodeConnected::Current(ts as i64),
+                            connected: NodeConnected::Current(ts),
                             connection_price: node.connection_price,
                             capacity_consumption: TotalConsumption::default(),
                             virtualized: node.virtualized,
@@ -917,7 +917,7 @@ async fn main() {
                         }
                     };
                     // Just to make sure reports are ordered
-                    if ts as i64 <= contract.last_report_ts {
+                    if ts <= contract.last_report_ts {
                         // Silently ignore reports out of order, we already covered this in an
                         // already processed consumption report. This can happen if the node pushes
                         // a contract consumption report twice.
@@ -936,7 +936,7 @@ async fn main() {
                     }
 
                     // If report ts predates start we ignore it.
-                    if (ts as i64) < start_ts {
+                    if ts < start_ts {
                         log_file
                             .write_all(
                                 format!(
@@ -956,7 +956,7 @@ async fn main() {
                     node.capacity_consumption.sru += (contract.resources.sru * data.window) as u128;
                     node.capacity_consumption.ips += contract.ips as u64 * data.window;
                     node.capacity_consumption.nru += data.nru;
-                    contract.last_report_ts = ts as i64;
+                    contract.last_report_ts = ts;
                     log_file
                         .write_all(
                             format!(
@@ -975,7 +975,7 @@ async fn main() {
                             Contract {
                                 _contract_id: contract.contract_id,
                                 node_id: nc.node_id,
-                                last_report_ts: ts as i64,
+                                last_report_ts: ts,
                                 ips: nc.public_ips,
                                 resources: Resources {
                                     hru: 0,
@@ -1128,7 +1128,7 @@ async fn main() {
         }
 
         // finally update progress bar
-        bar.set_message(Utc.timestamp_opt(ts as i64, 0).unwrap().to_rfc2822());
+        bar.set_message(Utc.timestamp_opt(ts, 0).unwrap().to_rfc2822());
         bar.inc(1);
 
         height += 1;
@@ -1470,7 +1470,7 @@ async fn main() {
             }
         }
 
-        bar.set_message(Utc.timestamp_opt(ts as i64, 0).unwrap().to_rfc2822());
+        bar.set_message(Utc.timestamp_opt(ts, 0).unwrap().to_rfc2822());
         bar.inc(1);
 
         height += 1;
@@ -1617,7 +1617,7 @@ async fn main() {
         };
         let stellar_address = if let Some(stellar_address) = payout_addresses.get(&receipt.farm_id)
         {
-            &stellar_address
+            stellar_address
         } else {
             ""
         };
@@ -1677,7 +1677,7 @@ async fn main() {
             previous_stellar_payout_address: failed_receipt.stellar_payout_address,
             stellar_payout_address: payout_addresses
                 .get(&failed_receipt.farm_id)
-                .map(|a| a.clone())
+                .cloned()
                 .unwrap_or("".to_string()),
             retry_for_receipt: hex::encode(hash),
             reward: failed_receipt.reward,
@@ -1712,7 +1712,7 @@ async fn main() {
             previous_stellar_payout_address: failed_receipt.stellar_payout_address,
             stellar_payout_address: payout_addresses
                 .get(&failed_receipt.farm_id)
-                .map(|a| a.clone())
+                .cloned()
                 .unwrap_or("".to_string()),
             retry_for_receipt: hex::encode(hash),
             reward: failed_receipt.fixup_reward,
@@ -1867,6 +1867,8 @@ impl MintingNode {
         // 1000000 so we have precision without working with floats.
         //
         // MIN is associative.
+        #[allow(clippy::identity_op)] // Allow explicit multiplication by 1 to make it clear we use
+        // 1 GiB here.
         let cu_intermediate = std::cmp::min(
             self.resources.cru as u128 * 2 * GIB * ONE_MILL,
             (self.resources.mru as u128 - 1 * GIB) * ONE_MILL / 4,
@@ -2195,7 +2197,7 @@ pub async fn get_payout_addresses(
 ) -> Result<BTreeMap<u32, String>, Box<dyn std::error::Error>> {
     let hash = client.hash_at_height(Some(block)).await?;
     let mut addresses = BTreeMap::new();
-    for (&id, _) in farms {
+    for &id in farms.keys() {
         match client.farm_payout_address(id, hash).await? {
             Some(a) => {
                 addresses.insert(id, a);
@@ -2270,7 +2272,7 @@ async fn block_import(
 ) -> mpsc::Receiver<(u32, i64, Vec<RuntimeEvents>)> {
     let mut t_rec = Vec::with_capacity(RPC_THREADS);
     for i in 0..RPC_THREADS {
-        let client = DynamicClient::new(&wss_url).await.unwrap();
+        let client = DynamicClient::new(wss_url).await.unwrap();
         let (tx, rx) = mpsc::channel(PRE_FETCH);
         let mut height = start + i;
         tokio::task::spawn(async move {

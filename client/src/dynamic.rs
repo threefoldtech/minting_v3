@@ -103,7 +103,7 @@ impl RuntimeClient for DynamicClient {
 
         let mut events: Vec<RuntimeEvents> = vec![];
         for event in b_events.iter() {
-            if !event.is_ok() {
+            if event.is_err() {
                 continue;
             }
             let evt = event?;
@@ -257,7 +257,7 @@ impl RuntimeClient for DynamicClient {
             return Ok(None);
         }
 
-        let r: Vec<u8> = result.unwrap().into_encoded().into();
+        let r: Vec<u8> = result.unwrap().into_encoded();
 
         if let Ok(twin) = codec::decode_from_bytes::<V141Twin>(r.clone().into()) {
             Ok(Some(twin.into()))
@@ -308,7 +308,7 @@ impl RuntimeClient for DynamicClient {
             return Ok(None);
         }
 
-        let r: Vec<u8> = result.unwrap().into_encoded().into();
+        let r: Vec<u8> = result.unwrap().into_encoded();
 
         if let Ok(farm) = codec::decode_from_bytes::<V141Farm>(r.clone().into()) {
             Ok(Some(farm.into()))
@@ -346,7 +346,7 @@ impl RuntimeClient for DynamicClient {
             return Ok(None);
         }
 
-        let r: Vec<u8> = result.unwrap().into_encoded().into();
+        let r: Vec<u8> = result.unwrap().into_encoded();
 
         Ok(Some(codec::decode_from_bytes(r.into())?))
     }
@@ -387,7 +387,7 @@ impl RuntimeClient for DynamicClient {
             return Ok(None);
         }
 
-        let r: Vec<u8> = result.unwrap().into_encoded().into();
+        let r: Vec<u8> = result.unwrap().into_encoded();
 
         if let Ok(node) = codec::decode_from_bytes::<V141Node>(r.clone().into()) {
             Ok(Some(node.into()))
