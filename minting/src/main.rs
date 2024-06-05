@@ -107,6 +107,9 @@ const MAX_POWER_MANAGER_DOWNTIME: u64 = 60 * 60 * 24;
 /// Maximum amount of seconds a node has before it needs to be booted as result of a farmer bot
 /// power up request.
 const MAX_POWER_MANAGER_BOOT_TIME: i64 = 60 * 30;
+/// The maximum amount of boot violations (for not booting fast enough) we allow for power managed
+/// nodes before striking a violation.
+const MAX_ALLOWED_BOOT_VIOLATIONS: usize = 1;
 
 #[tokio::main]
 async fn main() {
@@ -285,6 +288,7 @@ async fn main() {
                     farming_policy_id: node.farming_policy_id,
                     power_managed: None,
                     power_manage_boot: None,
+                    boot_duration_violations: 0,
                 },
             )
         })
@@ -492,6 +496,7 @@ async fn main() {
                             farming_policy_id: node.farming_policy_id,
                             power_managed: None,
                             power_manage_boot: None,
+                            boot_duration_violations: 0,
                         },
                     );
                     power_states.insert(
@@ -580,8 +585,26 @@ async fn main() {
                                     } else {
                                         0
                                     };
-                                // Only add uptime if node came back online in time.
-                                if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
+                                // Only add uptime if node boot did not violate any constraints.
+                                if time_delta as u64 > MAX_POWER_MANAGER_DOWNTIME {
+                                    log_file
+                                        .write_all(format!("Refusing to credit uptime for power managed node {} as the last boot was {time_delta} seconds ago, more than the allowed 24 hours\n", node.id).as_bytes())
+                                        .await
+                                        .unwrap();
+                                } else if (current_time - reported_uptime) as i64 - boot_request
+                                    > MAX_POWER_MANAGER_BOOT_TIME
+                                {
+                                    // Mark a violation on the node
+                                    node.boot_duration_violations += 1;
+                                    log_file
+                                            .write_all(format!("Detected farmer bot boot violation for node {}, request was done at {} but node only came online at {}\n",
+                                                node.id,
+                                                Utc.timestamp_opt(boot_request, 0).unwrap().to_rfc2822(),
+                                                Utc.timestamp_opt((current_time - reported_uptime) as i64, 0).unwrap().to_rfc2822()
+                                            ).as_bytes())
+                                            .await
+                                            .unwrap();
+                                } else {
                                     // Check and scale to match the actual period start if needed
                                     if time_set_down < start_ts {
                                         total_uptime += (current_time as i64 - start_ts) as u64;
@@ -606,33 +629,6 @@ async fn main() {
                                                 )
                                                 .as_bytes(),
                                             )
-                                            .await
-                                            .unwrap();
-                                    }
-                                } else {
-                                    log_file
-                                        .write_all(format!("Refusing to credit uptime for power managed node {} as the last boot was {time_delta} seconds ago, more than the allowed 24 hours\n", node.id).as_bytes())
-                                        .await
-                                        .unwrap();
-                                }
-                                // Speaking of time, node needs to be booted within the allotted time
-                                // frame.
-                                if (current_time - reported_uptime) as i64 - boot_request
-                                    > MAX_POWER_MANAGER_BOOT_TIME
-                                {
-                                    // Node took to long to boot.
-                                    if node.violation.is_none() {
-                                        node.violation = Violation::BootRequestExpired {
-                                            requested: boot_request,
-                                            booted: Some((current_time - reported_uptime) as _),
-                                        };
-
-                                        log_file
-                                            .write_all(format!("Detected farmer bot boot violation for node {}, request was done at {} but node only came online at {}\n",
-                                                node.id,
-                                                Utc.timestamp_opt(boot_request, 0).unwrap().to_rfc2822(),
-                                                Utc.timestamp_opt((current_time - reported_uptime) as i64, 0).unwrap().to_rfc2822()
-                                            ).as_bytes())
                                             .await
                                             .unwrap();
                                     }
@@ -1203,8 +1199,24 @@ async fn main() {
                             } else {
                                 0
                             };
+
+                            // Verify farmer bot boot constraints
+                            if (current_time - reported_uptime) as i64 - boot_request
+                                > MAX_POWER_MANAGER_BOOT_TIME
+                            {
+                                // Mark a violation on the node.
+                                node.boot_duration_violations += 1;
+                                log_file
+                                        .write_all(format!("Detected farmer bot boot violation for node {}, request was done at {} but node only came online at {}\n",
+                                            node.id,
+                                            Utc.timestamp_opt(boot_request, 0).unwrap().to_rfc2822(),
+                                            Utc.timestamp_opt((current_time - reported_uptime) as i64, 0).unwrap().to_rfc2822()
+                                        ).as_bytes())
+                                        .await
+                                        .unwrap();
+                            }
                             // Only add uptime if node came back online in time.
-                            if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
+                            else if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
                                 let uptime_diff = end_ts - i64::max(start_ts, time_set_down);
                                 assert!(
                                     uptime_diff >= 0,
@@ -1223,27 +1235,6 @@ async fn main() {
                                 .unwrap();
                             }
 
-                            // Speaking of time, node needs to be booted within the allotted time
-                            // frame.
-                            if (current_time - reported_uptime) as i64 - boot_request
-                                > MAX_POWER_MANAGER_BOOT_TIME
-                            {
-                                // Node took to long to boot.
-                                if node.violation.is_none() {
-                                    node.violation = Violation::BootRequestExpired {
-                                        requested: boot_request,
-                                        booted: Some((current_time - reported_uptime) as _),
-                                    };
-                                    log_file
-                                        .write_all(format!("Detected farmer bot boot violation for node {}, request was done at {} but node only came online at {}\n",
-                                            node.id,
-                                            Utc.timestamp_opt(boot_request, 0).unwrap().to_rfc2822(),
-                                            Utc.timestamp_opt((current_time - reported_uptime) as i64, 0).unwrap().to_rfc2822()
-                                        ).as_bytes())
-                                        .await
-                                        .unwrap();
-                                }
-                            }
                             // Clear the fact that we got power managed, if it is still the case, it
                             // will be set again in the proper event handler.
                             node.power_managed = None;
@@ -1485,8 +1476,12 @@ async fn main() {
     // requests, we haven't checked the case where the node does not respond at all. We already
     // fetched a days worth of blocks after the period ended, and don't keep track of power on
     // requests there. So any leftover requests here are already a day old, which is way too much.
-    // So if any node has an outstanding power on request here, stick them with a violation.
+    // So if any node has an outstanding power on request here, mark a boot failure.
+    //
+    // On top of this, if a node has more than the allowed amount of boot failures, stick a
+    // violation on them if there isn't anohter one already.
     for (_, node) in nodes.iter_mut() {
+        // First see if we need to mark another failure to boot in time.
         if let Some(boot_request) = node.power_manage_boot {
             // Ignore if this is the same as start, no need to slap a violation on what is likely a
             // dead node.
@@ -1497,13 +1492,8 @@ async fn main() {
                     ).as_bytes())
                     .await
                     .unwrap();
-                continue;
-            }
-            if node.violation.is_none() {
-                node.violation = Violation::BootRequestExpired {
-                    requested: boot_request,
-                    booted: None,
-                };
+            } else {
+                node.boot_duration_violations += 1;
                 log_file
                     .write_all(format!("Detected farmer bot boot violation for node {}, request was done at {} but node never booted\n",
                         node.id,
@@ -1512,6 +1502,13 @@ async fn main() {
                     .await
                     .unwrap();
             }
+        }
+
+        // Then slap on a violation if needed
+        if node.violation.is_none() && node.boot_duration_violations > MAX_ALLOWED_BOOT_VIOLATIONS {
+            node.violation = Violation::BootRequestExpired {
+                failed_boots: node.boot_duration_violations,
+            };
         }
     }
 
@@ -1845,6 +1842,8 @@ struct MintingNode {
     /// always have a node go up after target is set to up (i.e. farmerbot powers on a node).
     /// Cleared when node boots.
     power_manage_boot: Option<i64>,
+    /// Track the amount of times a farmerbot managed node failed to wake up within 30 minutes.
+    boot_duration_violations: usize,
 }
 
 impl MintingNode {

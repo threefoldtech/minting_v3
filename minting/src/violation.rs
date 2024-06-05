@@ -48,9 +48,8 @@ pub enum Violation {
     InvalidPublicKey,
     /// A node is refering to a twin which does not exist.
     MissingTwin,
-    /// A boot request from the farmer bot was not answered by the node in the allotted time to do
-    /// this.
-    BootRequestExpired { requested: i64, booted: Option<i64> },
+    /// Amount of boot requests the node failed to complete in the allotted time.
+    BootRequestExpired { failed_boots: usize },
 }
 
 impl fmt::Display for Violation {
@@ -64,7 +63,7 @@ impl fmt::Display for Violation {
             Violation::MissingRelay => f.pad("Node has uptime but the node twin does not have a relay set"),
             Violation::InvalidPublicKey => f.pad("Node twin has a public key set but it's not in a valid format"),
             Violation::MissingTwin => f.pad("Node twin does not exist"),
-            Violation::BootRequestExpired { requested, booted } => f.write_fmt(format_args!("Power managed node requested to boot at {requested} but {}", if let Some(booted) = booted { format!("only booted at {booted}") } else { "never booted".to_string() })),
+            Violation::BootRequestExpired { failed_boots } => f.write_fmt(format_args!("Power managed node failed {failed_boots} boot requests")),
         }
     }
 }
