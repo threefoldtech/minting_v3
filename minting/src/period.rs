@@ -64,15 +64,4 @@ impl Period {
     pub fn timestamp_in_period(&self, ts: i64) -> bool {
         ts >= self.start && ts <= self.end
     }
-
-    /// Adjusts the start time of this period.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if the provided new start time is bigger than the already set end
-    /// time of the period.
-    pub fn scale_start(&mut self, ts: i64) {
-        assert!(ts <= self.end);
-        self.start = ts;
-    }
 }

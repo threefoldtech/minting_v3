@@ -281,7 +281,6 @@ async fn main() {
                     uptime_info: None,
                     boot_time: None,
                     violation: Violation::None,
-                    connected: NodeConnected::Old,
                     connection_price: node.connection_price,
                     capacity_consumption: TotalConsumption::default(),
                     virtualized: node.virtualized,
@@ -489,7 +488,6 @@ async fn main() {
                             uptime_info: None,
                             boot_time: None,
                             violation: Violation::None,
-                            connected: NodeConnected::Current(ts),
                             connection_price: node.connection_price,
                             capacity_consumption: TotalConsumption::default(),
                             virtualized: node.virtualized,
@@ -1806,13 +1804,6 @@ async fn main() {
     }
 }
 
-enum NodeConnected {
-    /// Node was connected in a previous period.
-    Old,
-    /// Node was connected in the current period, first seen at the specified timestamp.
-    Current(i64),
-}
-
 struct MintingNode {
     id: u32,
     farm_id: u32,
@@ -1828,7 +1819,6 @@ struct MintingNode {
     // (boot time, original boot time record).
     boot_time: Option<(i64, i64)>,
     violation: Violation,
-    connected: NodeConnected,
     // TFT price expressed in USD at time of connection. Price is expressed in mUSD (3 digits
     // precision). I.e. 1 USD => 1000.
     connection_price: u32,
