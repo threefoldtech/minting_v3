@@ -577,12 +577,7 @@ async fn main() {
                                 // node got power managed to down
                                 let time_delta = current_time as i64 - time_set_down;
                                 assert!(time_delta >= 0, "uptime events can't travel back in time");
-                                let mut total_uptime =
-                                    if let Some((_, _, total_uptime)) = node.uptime_info {
-                                        total_uptime
-                                    } else {
-                                        0
-                                    };
+                                let (_, _, mut total_uptime) = node.uptime_info.unwrap_or_default();
                                 // Only add uptime if node boot did not violate any constraints.
                                 if time_delta as u64 > MAX_POWER_MANAGER_DOWNTIME {
                                     log_file
@@ -1949,11 +1944,7 @@ impl MintingNode {
         payout_addresses: &BTreeMap<u32, String>,
         farming_policies: &BTreeMap<u32, FarmPolicy>,
     ) -> MintingReceipt {
-        let uptime = if let Some((_, _, uptime)) = self.uptime_info {
-            uptime
-        } else {
-            0
-        };
+        let (_, _, uptime) = self.uptime_info.unwrap_or_default();
         let farm = farms.get(&self.farm_id).unwrap();
         let (cu, su, nu) = self.cloud_units_permill();
         let cu = cu as f64 / ONE_MILL as f64;
