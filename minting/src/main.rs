@@ -1448,6 +1448,63 @@ async fn main() {
                         }
                     }
                 }
+                RuntimeEvents::PowerTargetChanged(ptc) => {
+                    let node_power = match power_states.get_mut(&ptc.node_id) {
+                        Some(ps) => ps,
+                        // This could happen if a node is added post period and becomes power
+                        // managed.
+                        None => continue,
+                    };
+                    log_file
+                        .write_all(
+                            format!(
+                                "Power target changed for node {} from {:?} to {:?}\n",
+                                ptc.node_id, node_power.target, ptc.power_target,
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    // Remember a rising edge here to validate node actually boots.
+                    // This is cleared when a node sends an uptime report of a _reboot_. It is
+                    // allowed for this to happen if a rising edge is not consumed yet, in which
+                    // case the new event is ignored, as we want to measure time from the first
+                    // event and it is actually a good idea to send multiple of these if the node
+                    // does not react. Of course, we also only want to track this if the node is
+                    // currently power managed. While we shouldn't try to boot an online node,
+                    // there is no _real_ harm in doing it anyway.
+                    if ptc.power_target == Power::Up
+                        && matches!(node_power.state, PowerState::Down(_))
+                    {
+                        if let Some(node) = nodes.get_mut(&ptc.node_id) {
+                            // Only remember the first boot request.
+                            if node.power_manage_boot.is_none() {
+                                node.power_manage_boot = Some(ts);
+                                log_file
+                                    .write_all(
+                                        format!(
+                                            "Remembered boot request time for node {}\n",
+                                            node.id
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
+                        } else {
+                            panic!(
+                                "can't change power target for unknown node {} in block {}",
+                                ptc.node_id, height
+                            );
+                        }
+                    }
+                    node_power.target = ptc.power_target;
+                }
+                // We don't have to track power state changed events since those are only really
+                // used when the power target switches from up to down, to arm the trigger for a
+                // later wakeup. Since we are post period, that is not important since it implies
+                // the node is currently up. We only care about wakeups post period from sleeps
+                // inside the period
                 _ => {
                     // Don't care here
                 }
