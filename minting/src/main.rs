@@ -1184,10 +1184,15 @@ async fn main() {
                                 total_uptime,
                             )) = node.uptime_info
                             {
-                                assert!(
-                                    last_reported_at < end_ts,
-                                    "there can only be 1 uptime event post period for a power managed node"
-                                );
+                                if last_reported_at > end_ts {
+                                    log_file.write_all(
+                                        format!(
+                                            "Ignoring more than 1 farmer bot uptime event after period for node {}\n",
+                                            node.id,
+                                        ).as_bytes()
+                                    ).await.unwrap();
+                                    continue;
+                                }
                                 total_uptime
                             } else {
                                 0
@@ -1211,10 +1216,11 @@ async fn main() {
                             // Only add uptime if node came back online in time.
                             else if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
                                 let uptime_diff = end_ts - i64::max(start_ts, time_set_down);
-                                assert!(
-                                    uptime_diff >= 0,
-                                    "uptime event must be sent after node wen't down, chronology"
-                                );
+                                if uptime_diff < 0 {
+                                    log_file.write_all(format!(
+                                        "Ignoring farmer bot wakeup for node {} which went down after the period ended\n", node.id
+                                    ).as_bytes()).await.unwrap();
+                                }
                                 total_uptime += uptime_diff as u64;
                                 log_file
                                 .write_all(
@@ -1500,11 +1506,66 @@ async fn main() {
                     }
                     node_power.target = ptc.power_target;
                 }
-                // We don't have to track power state changed events since those are only really
-                // used when the power target switches from up to down, to arm the trigger for a
-                // later wakeup. Since we are post period, that is not important since it implies
-                // the node is currently up. We only care about wakeups post period from sleeps
-                // inside the period
+                // Technically this is not needed since we don't care for actual state changes
+                // after the period. After all, we only use this to arm a trigger to catch
+                // farmerbot wakes up. This trigger is set when the node goes from up to down, and
+                // in doing so it also sends an uptime report to chain. Since we are post period
+                // now, if the node goes to sleep now its sleep time won't influence the current
+                // period. Regardless add this code here so we can keep track of state changes and
+                // rely on the fact that we only allow 1 uptime post period to do the proper thing.
+                RuntimeEvents::PowerStateChanged(psc) => {
+                    let node_power = match power_states.get_mut(&psc.node_id) {
+                        Some(ps) => ps,
+                        None => continue,
+                    };
+                    log_file
+                        .write_all(
+                            format!(
+                                "Power state changed for node {} from {:?} to {:?}\n",
+                                psc.node_id, node_power.state, psc.power_state,
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    // Add exception to allow node 1 uptime ping once it gets back on which
+                    // indicates a reboot.
+                    // Also, we only allow this if the target is down as well.
+                    if node_power.target == Power::Down {
+                        // Only on state transition
+                        if node_power.state == PowerState::Up
+                            && matches!(psc.power_state, PowerState::Down(_))
+                        {
+                            // Keep track of this timestamp
+                            let node = match nodes.get_mut(&psc.node_id) {
+                                Some(node) => node,
+                                None => {
+                                    panic!("Node must be registered if its power target changes")
+                                }
+                            };
+                            // Either this is Some(timestamp), indicating a previous state
+                            // transition which was not followed by an uptime ping once the node
+                            // came online. In this case, we ignore that here. This would mean the
+                            // node did not come up again.
+                            // Otherwise, if None, set the current timestamp as time of going down.
+                            if node.power_managed.is_none() {
+                                // Also add an implicit uptime.
+                                node.power_managed = Some(ts);
+                                log_file
+                                    .write_all(
+                                        format!(
+                                            "Remembered farmer bot shutdown for node {}\n",
+                                            node.id
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    node_power.state = psc.power_state;
+                }
                 _ => {
                     // Don't care here
                 }
@@ -1538,6 +1599,15 @@ async fn main() {
             if boot_request == start_block_ts as i64 {
                 log_file
                     .write_all(format!("Not giving node {} a slow boot violation since it never tried to boot in the first place\n",
+                        node.id,
+                    ).as_bytes())
+                    .await
+                    .unwrap();
+            } else if boot_request > end_ts {
+                // Boot request (and possible failure) is entirely past the current period so we
+                // reserve the violation for next minting.
+                log_file
+                    .write_all(format!("Not giving node {} a slow boot violation since the wakup request happened post period\n",
                         node.id,
                     ).as_bytes())
                     .await
