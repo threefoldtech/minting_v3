@@ -2169,7 +2169,6 @@ impl MintingNode {
     ) -> (u64, u64) {
         if let Some((_, _, uptime)) = self.uptime_info {
             // Calculate uptime with 0.001% precision by upscaling with factor 1_000.
-            // We don't scale the period since the linear payment cancels out eventually.
             let mut uptime_percentage = uptime * 1_000 / period.duration();
             // Sanity check
             if uptime_percentage > 1_000 {
