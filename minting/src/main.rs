@@ -579,14 +579,18 @@ async fn main() {
                                 assert!(time_delta >= 0, "uptime events can't travel back in time");
                                 let (_, _, mut total_uptime) = node.uptime_info.unwrap_or_default();
                                 // Only add uptime if node boot did not violate any constraints.
+                                let mut credit_uptime = true;
                                 if time_delta as u64 > MAX_POWER_MANAGER_DOWNTIME {
+                                    credit_uptime = false;
                                     log_file
                                         .write_all(format!("Refusing to credit uptime for power managed node {} as the last boot was {time_delta} seconds ago, more than the allowed 24 hours\n", node.id).as_bytes())
                                         .await
                                         .unwrap();
-                                } else if (current_time - reported_uptime) as i64 - boot_request
+                                }
+                                if (current_time - reported_uptime) as i64 - boot_request
                                     > MAX_POWER_MANAGER_BOOT_TIME
                                 {
+                                    credit_uptime = false;
                                     // Mark a violation on the node
                                     node.boot_duration_violations += 1;
                                     log_file
@@ -597,7 +601,8 @@ async fn main() {
                                             ).as_bytes())
                                             .await
                                             .unwrap();
-                                } else {
+                                }
+                                if credit_uptime {
                                     // Check and scale to match the actual period start if needed
                                     if time_set_down < start_ts {
                                         total_uptime += (current_time as i64 - start_ts) as u64;
@@ -1199,13 +1204,22 @@ async fn main() {
                             };
 
                             // Verify farmer bot boot constraints
+                            let mut credit_uptime = true;
+                            if time_delta as u64 > MAX_POWER_MANAGER_DOWNTIME {
+                                credit_uptime = false;
+                                log_file
+                                    .write_all(format!("Refusing to credit uptime for power managed node {} post period as the last boot was {time_delta} seconds ago, more than the allowed 24 hours\n", node.id).as_bytes())
+                                    .await
+                                    .unwrap();
+                            }
                             if (current_time - reported_uptime) as i64 - boot_request
                                 > MAX_POWER_MANAGER_BOOT_TIME
                             {
+                                credit_uptime = false;
                                 // Mark a violation on the node.
                                 node.boot_duration_violations += 1;
                                 log_file
-                                        .write_all(format!("Detected farmer bot boot violation for node {}, request was done at {} but node only came online at {}\n",
+                                        .write_all(format!("Detected farmer bot boot violation for node {} post period, request was done at {} but node only came online at {}\n",
                                             node.id,
                                             Utc.timestamp_opt(boot_request, 0).unwrap().to_rfc2822(),
                                             Utc.timestamp_opt((current_time - reported_uptime) as i64, 0).unwrap().to_rfc2822()
@@ -1213,8 +1227,8 @@ async fn main() {
                                         .await
                                         .unwrap();
                             }
-                            // Only add uptime if node came back online in time.
-                            else if time_delta as u64 <= MAX_POWER_MANAGER_DOWNTIME {
+                            // All good, at uptime in period.
+                            if credit_uptime {
                                 let uptime_diff = end_ts - i64::max(start_ts, time_set_down);
                                 if uptime_diff < 0 {
                                     log_file.write_all(format!(
