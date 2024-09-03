@@ -125,6 +125,10 @@ async fn main() {
     let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
 
+    if period_offset != 75 {
+        panic!("This binary can only be used for fixing farmerbot wakeups in period 75");
+    }
+
     log_file
         .write_all(
             format!(
@@ -137,17 +141,15 @@ async fn main() {
         .await
         .unwrap();
 
-    // load previous receipts
-    let previous_period_offset = period_offset - 1;
-    println!("Loading receipts from period {}", previous_period_offset);
-    let mut previous_receipt_dir = path::PathBuf::new();
-    previous_receipt_dir.push("receipts");
-    previous_receipt_dir.push(previous_period_offset.to_string());
+    // Load existing receipts
+    let existing_receipt_dir = path::PathBuf::from("receipts/75");
+    println!("Loading receipts from period 75");
+    let mut existing_receipts = HashMap::new();
 
-    let mut previous_receipts = HashMap::new();
-
-    match std::fs::read_dir(&previous_receipt_dir) {
-        Err(_) => println!("Previous receipt dir does not exist, skip loading receipts"),
+    match std::fs::read_dir(&existing_receipt_dir) {
+        Err(_) => {
+            panic!("Existing receipt dir does not exist")
+        }
         Ok(dir_iter) => {
             for file in dir_iter {
                 let file = file.unwrap();
@@ -156,11 +158,11 @@ async fn main() {
                 }
                 let mut hash = [0; 32];
                 hex::decode_to_slice(file.file_name().as_bytes(), &mut hash).unwrap();
-                let mut path = previous_receipt_dir.clone();
+                let mut path = existing_receipt_dir.clone();
                 path.push(file.file_name());
                 let data = fs::read_to_string(path).unwrap();
                 let receipt: MintingReceipt = serde_json::from_str(&data).unwrap();
-                previous_receipts.insert(hash, receipt);
+                existing_receipts.insert(receipt.node_id, receipt);
             }
         }
     }
@@ -168,78 +170,8 @@ async fn main() {
     log_file
         .write_all(
             format!(
-                "Loaded {} receipts from previous period\n",
-                previous_receipts.len()
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-
-    // load previous fixup receipts
-    println!(
-        "Loading fixup receipts from period {}",
-        previous_period_offset
-    );
-    let mut previous_fixup_receipt_dir = path::PathBuf::new();
-    previous_fixup_receipt_dir.push("receipts");
-    previous_fixup_receipt_dir.push("fixed");
-    previous_fixup_receipt_dir.push(previous_period_offset.to_string());
-
-    let mut previous_fixup_receipts = HashMap::new();
-
-    match std::fs::read_dir(&previous_fixup_receipt_dir) {
-        Err(_) => {
-            println!("Previous fixup receipt dir does not exist, skip loading fixup receipts")
-        }
-        Ok(dir_iter) => {
-            for file in dir_iter {
-                let file = file.unwrap();
-                if !file.file_type().unwrap().is_file() {
-                    continue;
-                }
-                let mut hash = [0; 32];
-                hex::decode_to_slice(file.file_name().as_bytes(), &mut hash).unwrap();
-                let mut path = previous_fixup_receipt_dir.clone();
-                path.push(file.file_name());
-                let data = fs::read_to_string(path).unwrap();
-                let receipt: FixupReceipt = serde_json::from_str(&data).unwrap();
-                previous_fixup_receipts.insert(hash, receipt);
-            }
-        }
-    }
-
-    log_file
-        .write_all(
-            format!(
-                "Loaded {} fixup receipts from previous period\n",
-                previous_fixup_receipts.len()
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-
-    if !previous_receipts.is_empty() || !previous_fixup_receipts.is_empty() {
-        println!(
-            "Filtering receipts, pre filter length {}",
-            previous_receipts.len() + previous_fixup_receipts.len()
-        );
-        let horizon = stellar::Horizon::new(HORIZON_URL);
-        horizon
-            .filter_previous_mints(&mut previous_receipts, &mut previous_fixup_receipts)
-            .await;
-        println!(
-            "Done filtering receipts, post filter length {}",
-            previous_receipts.len() + previous_fixup_receipts.len()
-        );
-    }
-
-    log_file
-        .write_all(
-            format!(
-                "Filtered paid receipts, {} (fixup) receipts from previous period not paid yet\n",
-                previous_receipts.len() + previous_fixup_receipts.len()
+                "Loaded {} existing receipts from period\n",
+                existing_receipts.len()
             )
             .as_bytes(),
         )
@@ -580,7 +512,28 @@ async fn main() {
                                 let (_, _, mut total_uptime) = node.uptime_info.unwrap_or_default();
                                 // Only add uptime if node boot did not violate any constraints.
                                 let mut credit_uptime = true;
-                                if time_delta as u64 > MAX_POWER_MANAGER_DOWNTIME {
+                                // 15 July 2024 2:30:00 PM GMT+2
+                                const FARMERBOT_GRACE_START: i64 = 1721046600;
+                                // 19 July 2024 6:00:00 PM GMT+2
+                                const FARMERBOT_GRACE_END: i64 = 1721404800;
+                                if time_delta as u64 > MAX_POWER_MANAGER_DOWNTIME
+                                // Ignore this is we are power managed during the grace period.
+                                // Note we already checked that the current time is after time set
+                                // down.
+                                // We allow 1 day skew for both parts of the event since that is
+                                // the amount of time the farmerbot can be down, as such a sleep
+                                // could start up to 1 day before the grace period (wakeup in grace
+                                // period) and a wakeup can be one day after grace period (sleep in
+                                // grace period)
+                                    && !((current_time as i64 >= FARMERBOT_GRACE_START
+                                        && (current_time as i64)
+                                            < FARMERBOT_GRACE_END
+                                                + MAX_POWER_MANAGER_DOWNTIME as i64)
+                                        && (time_set_down < FARMERBOT_GRACE_END
+                                            && time_set_down
+                                                >= FARMERBOT_GRACE_START
+                                                    - MAX_POWER_MANAGER_DOWNTIME as i64))
+                                {
                                     credit_uptime = false;
                                     log_file
                                         .write_all(format!("Refusing to credit uptime for power managed node {} as the last boot was {time_delta} seconds ago, more than the allowed 24 hours\n", node.id).as_bytes())
@@ -1698,27 +1651,19 @@ async fn main() {
     }
 
     let mut receipts = BTreeMap::new();
+    let mut fixup_receipts = BTreeMap::new();
     let mut payout_file = std::fs::File::create("payouts.csv").unwrap();
     let mut overview_file = std::fs::File::create("overview.csv").unwrap();
-    let mut retry_file = std::fs::File::create("retries.csv").unwrap();
+    let mut fixup_file = std::fs::File::create("fixup.csv").unwrap();
 
     let mut carbon_tft_units = 0;
 
     writeln!(overview_file,"node id,twin id,farm name (farm id),period start,period end,measured uptime,CU,SU,NU,USD reward,TFT reward,TFT price on connect,carbon offset USD generated,carbon offset TFT generated,cru,cru used,mru,mru used,hru,hru used,sru,sru used,IP used,DIY state,Virtualized,violation,stellar address").unwrap();
+    writeln!(fixup_file, "node id,farm id,period start,period end,minted uptime,correct uptime,previous cu,previous su,previous nu,actual cu,actual su,actual nu,missing cu,missing su,missing nu,minted tft,actual tft,missing tft,minted carbon tft,actual carbon tft,missing carbon tft,minted receipt").unwrap();
     for (_, node) in nodes {
+        let old_receipt = &existing_receipts[&node.id];
         // generate receipt
         let receipt = node.receipt(period, &farms, &payout_addresses, &farming_policies);
-        if !receipt.stellar_payout_address.is_empty() && receipt.reward.tft != 0 {
-            writeln!(
-                payout_file,
-                "{},{}.{:07},{}",
-                receipt.stellar_payout_address,
-                receipt.reward.tft / UNITS_PER_TFT,
-                receipt.reward.tft % UNITS_PER_TFT,
-                hex::encode(receipt.hash()),
-            )
-            .unwrap();
-        }
 
         //let node_period = node.real_period(period);
         let node_period = receipt.period;
@@ -1788,81 +1733,76 @@ async fn main() {
             stellar_address,
         ).unwrap();
 
-        receipts.insert(receipt.hash(), receipt);
+        let fixup = FixupReceipt {
+            minted_uptime: old_receipt.measured_uptime,
+            correct_uptime: receipt.measured_uptime,
+            period: node_period,
+            node_id: node.id,
+            farm_id: node.farm_id,
+            minted_cloud_units: old_receipt.cloud_units,
+            correct_cloud_units: receipt.cloud_units,
+            fixup_cloud_units: receipt.cloud_units - old_receipt.cloud_units,
+            stellar_payout_address: receipt.stellar_payout_address.clone(),
+            minted_receipt: hex::encode(old_receipt.hash()),
+            correct_receipt: hex::encode(receipt.hash()),
+            minted_reward: old_receipt.reward,
+            correct_reward: receipt.reward,
+            fixup_reward: receipt.reward - old_receipt.reward,
+            minted_carbon_offset: old_receipt.carbon_offset,
+            correct_carbon_offset: receipt.carbon_offset,
+            fixup_carbon_offset: receipt.carbon_offset - old_receipt.carbon_offset,
+        };
+
+        writeln!(
+            fixup_file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}.{:07},{}.{:07},{}.{:07},{}.{:07},{}.{:07},{}.{:07},{}",
+            fixup.node_id,
+            fixup.farm_id,
+            Utc.timestamp_opt(fixup.period.start(), 0).unwrap(),
+            Utc.timestamp_opt(fixup.period.end(), 0).unwrap(),
+            fixup.minted_uptime,
+            fixup.correct_uptime,
+            fixup.minted_cloud_units.cu,
+            fixup.minted_cloud_units.su,
+            fixup.minted_cloud_units.nu,
+            fixup.correct_cloud_units.cu,
+            fixup.correct_cloud_units.su,
+            fixup.correct_cloud_units.nu,
+            fixup.fixup_cloud_units.cu,
+            fixup.fixup_cloud_units.su,
+            fixup.fixup_cloud_units.nu,
+            fixup.minted_reward.tft / UNITS_PER_TFT,
+            fixup.minted_reward.tft % UNITS_PER_TFT,
+            fixup.correct_reward.tft / UNITS_PER_TFT,
+            fixup.correct_reward.tft % UNITS_PER_TFT,
+            fixup.fixup_reward.tft / UNITS_PER_TFT,
+            fixup.fixup_reward.tft % UNITS_PER_TFT,
+            fixup.minted_carbon_offset.tft / UNITS_PER_TFT,
+            fixup.minted_carbon_offset.tft % UNITS_PER_TFT,
+            fixup.correct_carbon_offset.tft / UNITS_PER_TFT,
+            fixup.correct_carbon_offset.tft % UNITS_PER_TFT,
+            fixup.fixup_carbon_offset.tft / UNITS_PER_TFT,
+            fixup.fixup_carbon_offset.tft % UNITS_PER_TFT,
+            fixup.minted_receipt,
+        )
+        .unwrap();
+
+        if !fixup.stellar_payout_address.is_empty() && fixup.fixup_reward.tft != 0 {
+            writeln!(
+                payout_file,
+                "{},{}.{:07},{}",
+                fixup.stellar_payout_address,
+                fixup.fixup_reward.tft / UNITS_PER_TFT,
+                fixup.fixup_reward.tft % UNITS_PER_TFT,
+                hex::encode(fixup.hash()),
+            )
+            .unwrap();
+        }
 
         // Count carbon TFT credits
-        carbon_tft_units += co_tft;
-    }
-
-    // Retry payments once
-    let mut retry_receipts = HashMap::new();
-    for (hash, failed_receipt) in previous_receipts {
-        // no point in doing this
-        if failed_receipt.reward.tft == 0 {
-            continue;
-        }
-        let retry_receipt = RetryPayoutReceipt {
-            failed_payout_period: failed_receipt.period,
-            retry_period: period,
-            farm_id: failed_receipt.farm_id,
-            previous_stellar_payout_address: failed_receipt.stellar_payout_address,
-            stellar_payout_address: payout_addresses
-                .get(&failed_receipt.farm_id)
-                .cloned()
-                .unwrap_or("".to_string()),
-            retry_for_receipt: hex::encode(hash),
-            reward: failed_receipt.reward,
-        };
-        let retry_hash = hex::encode(retry_receipt.hash());
-
-        if !retry_receipt.stellar_payout_address.is_empty() && retry_receipt.reward.tft != 0 {
-            writeln!(
-                payout_file,
-                "{},{}.{:07},{}",
-                retry_receipt.stellar_payout_address,
-                retry_receipt.reward.tft / UNITS_PER_TFT,
-                retry_receipt.reward.tft % UNITS_PER_TFT,
-                retry_hash,
-            )
-            .unwrap();
-        }
-
-        retry_receipts.insert(retry_hash, retry_receipt);
-    }
-
-    let mut retry_fixed_receipts = HashMap::new();
-    for (hash, failed_receipt) in previous_fixup_receipts {
-        // no point in doing this
-        if failed_receipt.fixup_reward.tft == 0 {
-            continue;
-        }
-        let retry_receipt = RetryPayoutReceipt {
-            failed_payout_period: failed_receipt.period,
-            retry_period: period,
-            farm_id: failed_receipt.farm_id,
-            previous_stellar_payout_address: failed_receipt.stellar_payout_address,
-            stellar_payout_address: payout_addresses
-                .get(&failed_receipt.farm_id)
-                .cloned()
-                .unwrap_or("".to_string()),
-            retry_for_receipt: hex::encode(hash),
-            reward: failed_receipt.fixup_reward,
-        };
-        let retry_hash = hex::encode(retry_receipt.hash());
-
-        if !retry_receipt.stellar_payout_address.is_empty() && retry_receipt.reward.tft != 0 {
-            writeln!(
-                payout_file,
-                "{},{}.{:07},{}",
-                retry_receipt.stellar_payout_address,
-                retry_receipt.reward.tft / UNITS_PER_TFT,
-                retry_receipt.reward.tft % UNITS_PER_TFT,
-                retry_hash,
-            )
-            .unwrap();
-        }
-
-        retry_fixed_receipts.insert(retry_hash, retry_receipt);
+        carbon_tft_units += fixup.fixup_carbon_offset.tft;
+        receipts.insert(receipt.hash(), receipt);
+        fixup_receipts.insert(hex::encode(fixup.hash()), fixup);
     }
 
     // Sort hashes in lexicographical order
@@ -1894,47 +1834,15 @@ async fn main() {
         std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
     }
 
-    // Write retry receipts
-    writeln!(
-        retry_file,
-        "farm_id,previous_stellar_address,new_stellar_address,amount TFT,retry_for",
-    )
-    .unwrap();
+    // Write generated fixup receipts
+    let mut fixup_receipt_dir = path::PathBuf::new();
+    fixup_receipt_dir.push("receipts");
+    fixup_receipt_dir.push("fixed");
+    fixup_receipt_dir.push("75");
+    std::fs::create_dir_all(&fixup_receipt_dir).unwrap();
+    for (hash, receipt) in fixup_receipts {
+        let mut path = fixup_receipt_dir.clone();
 
-    let mut retry_receipt_dir = path::PathBuf::new();
-    retry_receipt_dir.push("receipts");
-    retry_receipt_dir.push("retries");
-    retry_receipt_dir.push(period_offset.to_string());
-    std::fs::create_dir_all(&retry_receipt_dir).unwrap();
-    for (hash, receipt) in retry_receipts {
-        writeln!(
-            retry_file,
-            "{},{},{},{}.{:07},{}",
-            receipt.farm_id,
-            receipt.previous_stellar_payout_address,
-            receipt.stellar_payout_address,
-            receipt.reward.tft / UNITS_PER_TFT,
-            receipt.reward.tft % UNITS_PER_TFT,
-            receipt.retry_for_receipt,
-        )
-        .unwrap();
-        let mut path = retry_receipt_dir.clone();
-        path.push(hash);
-        std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
-    }
-    for (hash, receipt) in retry_fixed_receipts {
-        writeln!(
-            retry_file,
-            "{},{},{},{}.{:07},{}",
-            receipt.farm_id,
-            receipt.previous_stellar_payout_address,
-            receipt.stellar_payout_address,
-            receipt.reward.tft / UNITS_PER_TFT,
-            receipt.reward.tft % UNITS_PER_TFT,
-            receipt.retry_for_receipt,
-        )
-        .unwrap();
-        let mut path = retry_receipt_dir.clone();
         path.push(hash);
         std::fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
     }
