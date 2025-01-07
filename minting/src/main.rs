@@ -445,7 +445,8 @@ async fn main() {
     let bar = ProgressBar::new(blocks as u64);
     bar.set_style(
         ProgressStyle::default_bar()
-            .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
+            .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})")
+            .expect("Can set valid template"),
     );
     let mut height = start_block;
     let mut import_queue = block_import(&wss_url, height as usize, end_block as usize).await;
@@ -1138,7 +1139,8 @@ async fn main() {
     let bar = ProgressBar::new(BLOCKS_IN_HOUR as u64 * 27);
     bar.set_style(
         ProgressStyle::default_bar()
-            .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})"),
+            .template("[Time on chain: {msg}] {wide_bar} {pos:>6}/{len:>6} (ETA: {eta_precise})")
+            .expect("Can set valid template"),
     );
 
     // Collect post-period uptime events. Violations don't matter here, those will be handled next
