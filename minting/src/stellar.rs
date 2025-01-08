@@ -39,7 +39,7 @@ impl Horizon {
 
             for tx in transactions_response.embedded().records() {
                 println!("{}", tx.hash());
-                if tx.memo_type() != "MEMO_HASH" {
+                if tx.memo_type() != "hash" {
                     continue;
                 }
                 if let Some(ref memo) = tx.memo() {
