@@ -31,11 +31,14 @@ impl Horizon {
             .set_account_id(TFT_ISSUER)
             .expect("Can set acccount");
         loop {
-            let transactions_response = self
+            let Ok(transactions_response) = self
                 .client
                 .get_transactions_for_account(&transactions_request)
                 .await
-                .unwrap();
+            else {
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                continue;
+            };
 
             for tx in transactions_response.embedded().records() {
                 if tx.memo_type() != "MEMO_HASH" {
