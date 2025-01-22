@@ -24,7 +24,7 @@ pub struct MintingReceipt {
     pub resource_units: ResourceUnits,
     pub resource_utilization: ResourceUtilization,
     pub reward: Reward,
-    pub carbon_offset: Reward,
+    pub carbon_offset: Option<Reward>,
     /// Certification type of the node, "Certified" or "DIY".
     pub node_type: String,
     #[serde(default = "default_farming_policy_id")]
