@@ -1236,8 +1236,8 @@ async fn main() {
                                     log_file.write_all(format!(
                                         "Ignoring farmer bot wakeup for node {} which went down after the period ended\n", node.id
                                     ).as_bytes()).await.unwrap();
-                                }
-                                total_uptime += uptime_diff as u64;
+                                } else {
+                                    total_uptime += uptime_diff as u64;
                                 log_file
                                 .write_all(
                                     format!(
@@ -1248,6 +1248,7 @@ async fn main() {
                                 )
                                 .await
                                 .unwrap();
+                                }
                             }
 
                             // Clear the fact that we got power managed, if it is still the case, it
