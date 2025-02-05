@@ -1224,16 +1224,16 @@ async fn main() {
                                     ).as_bytes()).await.unwrap();
                                 } else {
                                     total_uptime += uptime_diff as u64;
-                                log_file
-                                .write_all(
-                                    format!(
-                                        "Added {uptime_diff} seconds of uptime for node {}, for farmer bot boot post period\n",
-                                        node.id
-                                    )
-                                    .as_bytes(),
-                                )
-                                .await
-                                .unwrap();
+                                    log_file
+                                        .write_all(
+                                            format!(
+                                                "Added {uptime_diff} seconds of uptime for node {}, for farmer bot boot post period\n",
+                                                node.id
+                                            )
+                                            .as_bytes(),
+                                        )
+                                        .await
+                                        .unwrap();
                                 }
                             }
 
@@ -1773,7 +1773,6 @@ async fn main() {
         ).unwrap();
 
         receipts.insert(receipt.hash(), receipt);
-
     }
 
     // Retry payments once
@@ -1846,10 +1845,6 @@ async fn main() {
 
         retry_fixed_receipts.insert(retry_hash, retry_receipt);
     }
-
-    // Sort hashes in lexicographical order
-    let mut receipt_hashes = receipts.keys().cloned().collect::<Vec<_>>();
-    receipt_hashes.sort_unstable();
 
     // Write generated receipts
     let mut receipt_dir = path::PathBuf::new();
@@ -2104,16 +2099,6 @@ impl MintingNode {
         }
     }
 
-    /// Get the adjusted uptime of the node
-    fn uptime(&self, period: Period) -> u64 {
-        let period_duration = self.real_period(period).duration();
-        if let Some((_, _, uptime)) = self.uptime_info {
-            std::cmp::min(uptime, period_duration)
-        } else {
-            0
-        }
-    }
-
     /// Get the payout for a node in mUSD and units TFT for a period. This accounts for scaled
     /// period due to connection time, and SLA.
     ///
@@ -2173,7 +2158,6 @@ impl MintingNode {
             (0, 0)
         }
     }
-
 }
 
 struct Contract {
