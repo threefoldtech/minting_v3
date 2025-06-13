@@ -166,6 +166,8 @@ pub struct FixupReceipt {
     pub period: Period,
     pub node_id: u32,
     pub farm_id: u32,
+    pub minted_uptime: u64,
+    pub correct_uptime: u64,
     pub minted_cloud_units: CloudUnits,
     pub correct_cloud_units: CloudUnits,
     pub fixup_cloud_units: CloudUnits,
@@ -175,9 +177,9 @@ pub struct FixupReceipt {
     pub minted_reward: Reward,
     pub correct_reward: Reward,
     pub fixup_reward: Reward,
-    pub minted_carbon_offset: Reward,
-    pub correct_carbon_offset: Reward,
-    pub fixup_carbon_offset: Reward,
+    pub minted_carbon_offset: Option<Reward>,
+    pub correct_carbon_offset: Option<Reward>,
+    pub fixup_carbon_offset: Option<Reward>,
 }
 
 impl FixupReceipt {
