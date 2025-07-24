@@ -103,9 +103,9 @@ pub struct FixupReceipt {
     pub minted_reward: Reward,
     pub correct_reward: Reward,
     pub fixup_reward: Reward,
-    pub minted_carbon_offset: Reward,
-    pub correct_carbon_offset: Reward,
-    pub fixup_carbon_offset: Reward,
+    pub minted_carbon_offset: Option<Reward>,
+    pub correct_carbon_offset: Option<Reward>,
+    pub fixup_carbon_offset: Option<Reward>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
