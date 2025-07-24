@@ -111,6 +111,10 @@ async fn main() {
     let end_ts: i64 = period.end();
     let wss_url = args.next().unwrap();
 
+    if period_offset != 86 {
+        panic!("This binary can only be used to mint period 86 (june 2025)");
+    }
+
     log_file
         .write_all(
             format!(
@@ -125,7 +129,7 @@ async fn main() {
 
     // load previous receipts
     let previous_period_offset = period_offset - 1;
-    println!("Loading receipts from period {}", previous_period_offset);
+    println!("Loading receipts from period {previous_period_offset}");
     let mut previous_receipt_dir = path::PathBuf::new();
     previous_receipt_dir.push("receipts");
     previous_receipt_dir.push(previous_period_offset.to_string());
@@ -163,10 +167,7 @@ async fn main() {
         .unwrap();
 
     // load previous fixup receipts
-    println!(
-        "Loading fixup receipts from period {}",
-        previous_period_offset
-    );
+    println!("Loading fixup receipts from period {previous_period_offset}");
     let mut previous_fixup_receipt_dir = path::PathBuf::new();
     previous_fixup_receipt_dir.push("receipts");
     previous_fixup_receipt_dir.push("fixed");
@@ -547,11 +548,15 @@ async fn main() {
                 RuntimeEvents::NodeUptimeReported(id, current_time, reported_uptime) => {
                     let node = match nodes.get_mut(&id) {
                         Some(node) => node,
-                        None => panic!(
-                            "can't report uptime for unknown node {} in block {}",
-                            id, height
-                        ),
+                        None => {
+                            panic!("can't report uptime for unknown node {id} in block {height}")
+                        }
                     };
+
+                    /// 13 June 2025 19:00:00 GMT+2
+                    const GRACE_PERIOD_START: i64 = 1_749_841_200;
+                    /// 17 June 2025 18:50:00 GMT+2
+                    const GRACE_PERIOD_END: i64 = 1_750_186_200;
 
                     // We are power managed and got a request to wake up.
                     match (node.power_managed, node.power_manage_boot) {
@@ -567,7 +572,23 @@ async fn main() {
                                 let (_, _, mut total_uptime) = node.uptime_info.unwrap_or_default();
                                 // Only add uptime if node boot did not violate any constraints.
                                 let mut credit_uptime = true;
-                                if time_delta as u64 > MAX_POWER_MANAGER_DOWNTIME {
+                                if time_delta as u64 > MAX_POWER_MANAGER_DOWNTIME
+                                // Ignore this is we are power managed during the grace period.
+                                // Note we already checked that the current time is after time set
+                                // down.
+                                // We allow 1 day skew for both parts of the event since that is
+                                // the amount of time the farmerbot can be down, as such a sleep
+                                // could start up to 1 day before the grace period (wakeup in grace
+                                // period) and a wakeup can be one day after grace period (sleep in
+                                // grace period)
+                                    && !((current_time as i64 >= GRACE_PERIOD_START
+                                        && (current_time as i64)
+                                            < GRACE_PERIOD_END + MAX_POWER_MANAGER_DOWNTIME as i64)
+                                        && (time_set_down < GRACE_PERIOD_END
+                                            && time_set_down
+                                                >= GRACE_PERIOD_START
+                                                    - MAX_POWER_MANAGER_DOWNTIME as i64))
+                                {
                                     credit_uptime = false;
                                     log_file
                                         .write_all(format!("Refusing to credit uptime for power managed node {} as the last boot was {time_delta} seconds ago, more than the allowed 24 hours\n", node.id).as_bytes())
@@ -733,12 +754,25 @@ async fn main() {
                                         // That being said, we also limit the amount of uptime credit
                                         // to the uptime report interval + grace period, as healthy
                                         // nodes _must_ ping every interval amount of time
-                                        let credit = u64::min(
-                                            uptime_delta as u64,
-                                            (NODE_UPTIME_REPORT_INTERVAL_SECONDS
-                                                + UPTIME_GRACE_PERIOD_SECONDS)
-                                                as u64,
-                                        );
+                                        //
+                                        // During grace period we don't expect nodes to send uptime
+                                        // reports, so just accept everything during this window.
+                                        // Nodes report uptime every 40 minutes.
+                                        let credit = if (current_time as i64) < GRACE_PERIOD_START
+                                            || current_time as i64
+                                                >= GRACE_PERIOD_END
+                                                    + NODE_UPTIME_REPORT_INTERVAL_SECONDS
+                                        {
+                                            u64::min(
+                                                uptime_delta as u64,
+                                                (NODE_UPTIME_REPORT_INTERVAL_SECONDS
+                                                    + UPTIME_GRACE_PERIOD_SECONDS)
+                                                    as u64,
+                                            )
+                                        } else {
+                                            log_file.write_all(format!("Setting credit for node {} to {uptime_delta} during grace period window\n", node.id).as_bytes()).await.unwrap();
+                                            uptime_delta as u64
+                                        };
                                         total_uptime += credit;
                                         if credit != uptime_delta as u64 {
                                             log_file
