@@ -1,21 +1,36 @@
 # Minting V3
 
-Minting code for ThreeFold Grid v3, using v3 tokenomics. This repository calculates and validates TFT (ThreeFold Token) minting based on blockchain capacity and uptime data.
+A token minting calculation engine that validates and computes token rewards based on blockchain-tracked resource capacity and uptime data.
 
-## description of process
+## What this is
 
-- TFChain is our blockchain has all details about capacity provided by the nodes
-- TFChain is used to track uptime
-- Zero-OS reports to TFChain
-- Additional Auditing Code will be added in v4 (special code generated at runtime verifies) using security primitives on motherboards
-- The code in this repo uses the information from the blockchain to calculate the to be minted TFT
-- A proof of what needs to be minted and why is created, this gets sent to our guardians
-- The guardians need to double check the execution and the minting report (this is like a human check on the process)
-- The guardians need to sign, only when consensus achieved the minting as suggested will happen (this allows human to check code)
+This repository implements a tokenomics model for calculating and distributing token rewards based on verified infrastructure contributions. It reads capacity and uptime data from a blockchain, validates the inputs, computes the reward allocations, and generates a cryptographic proof report. The proof report is submitted for multi-party human verification before any tokens are minted.
 
-> Its important to understant that our Blockchain tracks the capacity and uptime and is the source for the minting.
+The process ensures transparent, verifiable token issuance tied to actual resource contributions.
+
+## What this repository contains
+
+- **Minting calculation logic** — reads capacity and uptime records from the blockchain and computes reward allocations.
+- **Proof generation** — produces a detailed, auditable report showing exactly what should be minted and why.
+- **Guardian verification flow** — the proof report is distributed to guardians who review and sign off on the computation before execution.
+
+## Role in the stack
+
+- A blockchain records all capacity provided by nodes and tracks their uptime.
+- Node operating systems report capacity and uptime to the blockchain.
+- The code in this repository uses the on-chain data as the single source of truth to calculate rewards.
+- A proof of the intended minting is created and sent to guardians for consensus-based human review.
+- Only after guardian consensus is achieved is the minting executed.
+
+## Relation to ThreeFold
+
+This technology is used within the ThreeFold ecosystem and was first deployed on the ThreeFold Grid. The component itself is designed as reusable infrastructure technology and should be understood by its technical function first, independent of any specific deployment.
+
+## Ownership
+
+This repository is owned and maintained by TF-Tech NV, a Belgian company responsible for the development and maintenance of this technology.
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-Copyright (c) TFTech NV.
+This project is licensed under the Apache License 2.0 — see the [LICENSE](LICENSE) file for details.
+Copyright (c) TF-Tech NV.
