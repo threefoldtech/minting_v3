@@ -1,4 +1,4 @@
-# Minting V3
+# Ledger Minting
 
 A token minting calculation engine that validates and computes token rewards based on blockchain-tracked resource capacity and uptime data.
 
