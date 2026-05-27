@@ -1,6 +1,6 @@
-# minting_v3
+# Minting V3
 
-minting code for grid v3, using v3 tokenomics
+Minting code for ThreeFold Grid v3, using v3 tokenomics. This repository calculates and validates TFT (ThreeFold Token) minting based on blockchain capacity and uptime data.
 
 ## description of process
 
@@ -14,3 +14,8 @@ minting code for grid v3, using v3 tokenomics
 - The guardians need to sign, only when consensus achieved the minting as suggested will happen (this allows human to check code)
 
 > Its important to understant that our Blockchain tracks the capacity and uptime and is the source for the minting.
+
+## License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+Copyright (c) TFTech NV.
